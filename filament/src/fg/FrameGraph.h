@@ -416,7 +416,7 @@ public:
      */
     FrameGraphId<FrameGraphTexture> import(utils::StaticString name,
             FrameGraphRenderPass::ImportDescriptor const& desc,
-            backend::Handle<backend::HwRenderTarget> target);
+            backend::Handle<backend::HwRenderTarget> target) noexcept;
 
 
     /**
@@ -424,7 +424,7 @@ public:
      * @param handle handle to test validity for
      * @return true of the handle is valid, false otherwise.
      */
-    bool isValid(FrameGraphHandle handle) const;
+    bool isValid(FrameGraphHandle handle) const noexcept;
 
     /**
      * Returns whether a pass has been culled after FrameGraph::compile()

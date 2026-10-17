@@ -75,7 +75,7 @@ ostream::Buffer const& ostream::getBuffer() const noexcept {
     return mImpl->mData;
 }
 
-const char* ostream::getFormat(type const t) const noexcept {
+inline const char* ostream::getFormat(type const t) const noexcept {
     switch (t) {
         case SHORT:       return mImpl->mShowHex ? "0x%hx"  : "%hd";
         case USHORT:      return mImpl->mShowHex ? "0x%hx"  : "%hu";

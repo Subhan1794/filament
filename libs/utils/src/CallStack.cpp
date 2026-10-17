@@ -120,6 +120,7 @@ bool CallStack::operator<(const CallStack& rhs) const {
 
 // ------------------------------------------------------------------------------------------------
 
+UTILS_NOINLINE
 CString CallStack::demangle(const char* mangled) {
 #if !defined(NDEBUG) && !defined(WIN32)
     size_t len;
