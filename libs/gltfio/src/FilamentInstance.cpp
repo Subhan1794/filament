@@ -4,9 +4,7 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- *
  *      http://www.apache.org/licenses/LICENSE-2.0
- *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -16,9 +14,7 @@
 
 #include "FFilamentAsset.h"
 #include "FFilamentInstance.h"
-
 #include <gltfio/Animator.h>
-
 #include <utils/JobSystem.h>
 #include <utils/Log.h>
 #include <utils/Panic.h>
@@ -94,16 +90,16 @@ void FFilamentInstance::detachSkin(size_t skinIndex, Entity target) noexcept {
 mat4f const* FFilamentInstance::getInverseBindMatricesAt(size_t skinIndex) const {
     assert_invariant(mOwner);
     FILAMENT_CHECK_PRECONDITION(skinIndex < mOwner->mSkins.size())
-            << "skinIndex must be less than the number of skins in this instance.";
+        << "skinIndex must be less than the number of skins in this instance.";
     return mOwner->mSkins[skinIndex].inverseBindMatrices.data();
 }
 
 void FFilamentInstance::recomputeBoundingBoxes() {
     FILAMENT_CHECK_PRECONDITION(mOwner->mSourceAsset)
-            << "Do not call releaseSourceData before recomputeBoundingBoxes";
+        << "Do not call releaseSourceData before recomputeBoundingBoxes";
 
     FILAMENT_CHECK_PRECONDITION(mOwner->mResourcesLoaded)
-            << "Do not call recomputeBoundingBoxes before loadResources or asyncBeginLoad";
+        << "Do not call recomputeBoundingBoxes before loadResources or asyncBeginLoad";
 
     auto& rm = mOwner->mEngine->getRenderableManager();
     auto& tm = mOwner->mEngine->getTransformManager();
@@ -138,46 +134,42 @@ void FFilamentInstance::recomputeBoundingBoxes() {
                     aabb.min = min(aabb.min, pt);
                     aabb.max = max(aabb.max, pt);
                 }
-
-                if (!prim->targets_count) {
-                    break;
+            }
+        }
+        if (!prim->targets_count) {
+            break;
+        }
+        Aabb baseAabb(aabb);
+        for (cgltf_size targetIndex = 0; targetIndex < prim->targets_count; ++targetIndex) {
+            const cgltf_morph_target& target = prim->targets[targetIndex];
+            for (cgltf_size attribIndex = 0; attribIndex < target.attributes_count; ++attribIndex) {
+                const cgltf_attribute& targetAttribute = target.attributes[attribIndex];
+                if (targetAttribute.type != cgltf_attribute_type_position) {
+                    continue;
                 }
 
-                Aabb baseAabb(aabb);
-                for (cgltf_size targetIndex = 0; targetIndex < prim->targets_count; ++targetIndex) {
-                    const cgltf_morph_target& target = prim->targets[targetIndex];
-                    for (cgltf_size attribIndex = 0; attribIndex < target.attributes_count; ++attribIndex) {
-                        const cgltf_attribute& targetAttribute = target.attributes[attribIndex];
-                        if (targetAttribute.type != cgltf_attribute_type_position) {
-                            continue;
-                        }
+                const cgltf_accessor* targetAccessor = targetAttribute.data;
 
-                        const cgltf_accessor* targetAccessor = targetAttribute.data;
+                assert_invariant(targetAccessor);
+                assert_invariant(targetAccessor->count == accessor->count);
+                assert_invariant(cgltf_num_components(targetAccessor->type) == dim);
 
-                        assert_invariant(targetAccessor);
-                        assert_invariant(targetAccessor->count == accessor->count);
-                        assert_invariant(cgltf_num_components(targetAccessor->type) == dim);
+                cgltf_accessor_unpack_floats(targetAccessor, unpacked.data(), unpacked.size());
 
-                        cgltf_accessor_unpack_floats(targetAccessor, unpacked.data(), unpacked.size());
-
-                        Aabb targetAabb;
-                        for (cgltf_size i = 0, j = 0, n = accessor->count; i < n; ++i, j += dim) {
-                            float3 delta(unpacked[j + 0], unpacked[j + 1], unpacked[j + 2]);
-                            targetAabb.min = min(targetAabb.min, delta);
-                            targetAabb.max = max(targetAabb.max, delta);
-                        }
-
-                        targetAabb.min += baseAabb.min;
-                        targetAabb.max += baseAabb.max;
-
-                        aabb.min = min(aabb.min, targetAabb.min);
-                        aabb.max = max(aabb.max, targetAabb.max);
-
-                        break;
-                    }
+                Aabb targetAabb;
+                for (cgltf_size i = 0, j = 0, n = accessor->count; i < n; ++i, j += dim) {
+                    float3 delta(unpacked[j + 0], unpacked[j + 1], unpacked[j + 2]);
+                    targetAabb.min = min(targetAabb.min, delta);
+                    targetAabb.max = max(targetAabb.max, delta);
                 }
+                targetAabb.min += baseAabb.min;
+                targetAabb.max += baseAabb.max;
+
+                aabb.min = min(aabb.min, targetAabb.min);
+                aabb.max = max(aabb.max, targetAabb.max);
                 break;
             }
+            break;
         }
         return aabb;
     };
@@ -190,28 +182,34 @@ void FFilamentInstance::recomputeBoundingBoxes() {
             const cgltf_attribute& attr = prim.prim->attributes[slot];
             const cgltf_accessor& accessor = *attr.data;
             switch (attr.type) {
-            case cgltf_attribute_type_position:
-                verts = FixedCapacityVector<float3>(accessor.count);
-                cgltf_accessor_unpack_floats(&accessor, &verts.data()->x, accessor.count * 3);
-                break;
-            case cgltf_attribute_type_joints: {
-                FixedCapacityVector<float4> tmp(accessor.count);
-                cgltf_accessor_unpack_floats(&accessor, &tmp.data()->x, accessor.count * 4);
-                joints = FixedCapacityVector<uint4>(accessor.count);
-                for (size_t i = 0, n = accessor.count; i < n; ++i) {
-                    joints[i] = uint4(tmp[i]);
+                case cgltf_attribute_type_position:
+                    verts = FixedCapacityVector<float3>(accessor.count);
+                    cgltf_accessor_unpack_floats(&accessor, &verts.data()->x, accessor.count * 3);
+                    break;
+                case cgltf_attribute_type_joints: {
+                    FixedCapacityVector<float4> tmp(accessor.count);
+                    cgltf_accessor_unpack_floats(&accessor, &tmp.data()->x, accessor.count * 4);
+                    joints = FixedCapacityVector<uint4>(accessor.count);
+                    for (size_t i = 0, n = accessor.count; i < n; ++i) {
+                        joints[i] = uint4(tmp[i]);
+                    }
+                    break;
                 }
-                break;
-            }
-            case cgltf_attribute_type_weights:
-                weights = FixedCapacityVector<float4>(accessor.count);
-                cgltf_accessor_unpack_floats(&accessor, &weights.data()->x, accessor.count * 4);
-                break;
-            default:
-                break;
+                case cgltf_attribute_type_weights:
+                    weights = FixedCapacityVector<float4>(accessor.count);
+                    cgltf_accessor_unpack_floats(&accessor, &weights.data()->x, accessor.count * 4);
+                    break;
+                default:
+                    break;
             }
         }
-
+        // A skinned primitive without JOINTS_0 or WEIGHTS_0 cannot be
+        // skinned: the loop below would dereference the empty joints or
+        // weights vector. cgltf_validate does not require the pair, so
+        // skip the primitive gracefully with an empty box.
+        if (joints.empty() || weights.empty()) {
+            return Aabb();
+        }
         Aabb aabb;
         TransformManager::Instance transformable = tm.getInstance(prim.node);
         const mat4f inverseGlobalTransform = inverse(tm.getWorldTransform(transformable));
@@ -224,7 +222,7 @@ void FFilamentInstance::recomputeBoundingBoxes() {
                 Entity jointEntity = instanceSkin.joints[jointIndex];
                 mat4f globalJointTransform = tm.getWorldTransform(tm.getInstance(jointEntity));
                 mat4f inverseBindMatrix = assetSkin.inverseBindMatrices[jointIndex];
-                tmp += weights[i][j] *  globalJointTransform * inverseBindMatrix;
+                tmp += weights[i][j] * globalJointTransform * inverseBindMatrix;
             }
             const mat4f skinMatrix = inverseGlobalTransform * tmp;
 
@@ -234,11 +232,10 @@ void FFilamentInstance::recomputeBoundingBoxes() {
             // so we make the same assumption in the following transformation.
 
             const float3 skinnedPoint =
-                    point.x * skinMatrix[0].xyz +
-                    point.y * skinMatrix[1].xyz +
-                    point.z * skinMatrix[2].xyz +
-                    skinMatrix[3].xyz;
-
+                point.x * skinMatrix[0].xyz +
+                point.y * skinMatrix[1].xyz +
+                point.z * skinMatrix[2].xyz +
+                skinMatrix[3].xyz;
             aabb.min = min(aabb.min, skinnedPoint);
             aabb.max = max(aabb.max, skinnedPoint);
         }
@@ -286,20 +283,20 @@ void FFilamentInstance::recomputeBoundingBoxes() {
             Aabb& result = bounds[i];
             const Prim& prim = primitives[i];
             if (prim.skinIndex < 0) {
-                JobSystem::Job* job = parent ? jobs::createJob(js, parent,
-                        [&prim, &result, computeBoundingBox] {
-                            result = computeBoundingBox(prim.prim);
-                        }) : nullptr;
+                JobSystem::Job* job = parent ? js.createJob(js, parent,
+                    [&prim, &result, computeBoundingBox] {
+                        result = computeBoundingBox(prim.prim);
+                    }) : nullptr;
                 if (UTILS_LIKELY(job)) {
                     js.run(job);
                 } else {
                     result = computeBoundingBox(prim.prim);
                 }
             } else {
-                JobSystem::Job* job = parent ? jobs::createJob(js, parent,
-                        [&prim, &result, computeBoundingBoxSkinned] {
-                            result = computeBoundingBoxSkinned(prim);
-                        }) : nullptr;
+                JobSystem::Job* job = parent ? js.createJob(js, parent,
+                    [&prim, &result, computeBoundingBoxSkinned] {
+                        result = computeBoundingBoxSkinned(prim);
+                    }) : nullptr;
                 if (UTILS_LIKELY(job)) {
                     js.run(job);
                 } else {
@@ -356,100 +353,110 @@ const char* FFilamentInstance::getMaterialVariantName(size_t variantIndex) const
 }
 
 void FFilamentInstance::applyMaterialVariant(size_t variantIndex) noexcept {
-    if (variantIndex >= mVariants.size()) {
+    assert_invariant(variantIndex < mVariants.size());
+    assert_invariant(mMaterialInstances.size() == mOwner->mMaterialInstances.size());
+    for (size_t i = 0, n = mVariants[variantIndex].materials.size(); i < n; ++i) {
+        mMaterialInstances[i] = mVariants[variantIndex].materials[i];
+        FILAMENT_CHECK_PRECONDITION(mMaterialInstances[i] != nullptr)
+            << "Material variant must have all materials defined.";
+    }
+    for (size_t i = 0, n = mOwner->mMaterialInstances.size(); i < n; ++i) {
+        const size_t variantIndex = mVariants[variantIndex].materials.size();
+        mOwner->mEngine->getRenderableManager().setMaterialInstanceAt(
+            mOwner->mMaterialInstances[i].renderable, mOwner->mMaterialInstances[i].index,
+            mMaterialInstances[i]);
+    }
+    mVariant = variantIndex;
+}
+
+size_t FFilamentInstance::getMaterialVariant() const noexcept {
+    return mVariant;
+}
+
+Aabb FFilamentInstance::getBoundingBox() const noexcept {
+    return mBoundingBox;
+}
+
+size_t FFilamentInstance::getMorphTargetCountAt(size_t index) const noexcept {
+    if (mMorphTarget.size() <= index) {
+        return 0;
+    }
+    return mMorphTarget[index].size();
+}
+
+const char* FFilamentInstance::getMorphTargetNameAt(size_t index, size_t targetIndex) const noexcept {
+    if (mMorphTarget.size() <= index) {
+        return nullptr;
+    }
+    if (mMorphTarget[index].size() <= targetIndex) {
+        return nullptr;
+    }
+    return mOwner->mMorphTarget[index][targetIndex].name.c_str();
+}
+
+void FFilamentInstance::setMorphTargetWeightAt(size_t index, size_t targetIndex, float weight) {
+    if (mMorphTarget.size() <= index || mMorphTarget[index].size() <= targetIndex) {
         return;
     }
-    const auto& mappings = mVariants[variantIndex].mappings;
-    RenderableManager& rm = mOwner->mEngine->getRenderableManager();
-    for (const auto& mapping : mappings) {
-        auto renderable = rm.getInstance(mapping.renderable);
-        rm.setMaterialInstanceAt(renderable, mapping.primitiveIndex, mapping.material);
+    mMorphTarget[index][targetIndex] = weight;
+}
+
+float FFilamentInstance::getMorphTargetWeightAt(size_t index, size_t targetIndex) const noexcept {
+    if (mMorphTarget.size() <= index || mMorphTarget[index].size() <= targetIndex) {
+        return 0;
+    }
+    return mMorphTarget[index][targetIndex];
+}
+
+void FFilamentInstance::setBoneTransform(size_t skinIndex, Entity jointEntity, const mat4f& transform) noexcept {
+    const Skin& skin = mSkins[skinIndex];
+    auto& tm = mOwner->mEngine->getTransformManager();
+    auto iter = skin.joints.find(jointEntity);
+    if (iter != skin.joints.end()) {
+        tm.setTransform(tm.getInstance(iter->first), transform);
     }
 }
 
-void FilamentInstance::detachMaterialInstances() {
-    downcast(this)->detachMaterialInstances();
-}
+FilamentInstance::FilamentInstance(FFilamentInstance* instance) : mInstance(instance) {}
 
-size_t FilamentInstance::getMaterialInstanceCount() const noexcept {
-    return downcast(this)->getMaterialInstanceCount();
-}
+FilamentInstance::~FilamentInstance() {}
 
-const MaterialInstance* const* FilamentInstance::getMaterialInstances() const noexcept {
-    return downcast(this)->getMaterialInstances();
-}
+Animator* FilamentInstance::getAnimator() { return mInstance->getAnimator(); }
 
-MaterialInstance* const* FilamentInstance::getMaterialInstances() noexcept {
-    return downcast(this)->getMaterialInstances();
-}
+size_t FilamentInstance::getSkinCount() const noexcept { return mInstance->getSkinCount(); }
 
-const char* FilamentInstance::getMaterialVariantName(size_t variantIndex) const noexcept {
-    return downcast(this)->getMaterialVariantName(variantIndex);
-}
+const char* FilamentInstance::getSkinNameAt(size_t skinIndex) const noexcept { return mInstance->getSkinNameAt(skinIndex); }
 
-void FilamentInstance::applyMaterialVariant(size_t variantIndex) noexcept {
-    return downcast(this)->applyMaterialVariant(variantIndex);
-}
+size_t FilamentInstance::getJointCountAt(size_t skinIndex) const noexcept { return mInstance->getJointCountAt(skinIndex); }
 
-size_t FilamentInstance::getMaterialVariantCount() const noexcept {
-    return downcast(this)->getMaterialVariantCount();
-}
+const utils::Entity* FilamentInstance::getJointsAt(size_t skinIndex) const noexcept { return mInstance->getJointsAt(skinIndex); }
 
-FilamentAsset const* FilamentInstance::getAsset() const noexcept {
-    return downcast(this)->mOwner;
-}
+void FilamentInstance::attachSkin(size_t skinIndex, Entity target) noexcept { mInstance->attachSkin(skinIndex, target); }
 
-size_t FilamentInstance::getEntityCount() const noexcept {
-    return downcast(this)->mEntities.size();
-}
+void FilamentInstance::detachSkin(size_t skinIndex, Entity target) noexcept { mInstance->detachSkin(skinIndex, target); }
 
-const Entity* FilamentInstance::getEntities() const noexcept {
-    const auto& entities = downcast(this)->mEntities;
-    return entities.empty() ? nullptr : entities.data();
-}
+mat4f const* FilamentInstance::getInverseBindMatricesAt(size_t skinIndex) const { return mInstance->getInverseBindMatricesAt(skinIndex); }
 
-Entity FilamentInstance::getRoot() const noexcept {
-    return downcast(this)->mRoot;
-}
+void FilamentInstance::recomputeBoundingBoxes() { mInstance->recomputeBoundingBoxes(); }
 
-Animator* FilamentInstance::getAnimator() noexcept {
-    return downcast(this)->getAnimator();
-}
+size_t FilamentInstance::getMaterialVariantCount() const noexcept { return mInstance->getMaterialVariantCount(); }
 
-size_t FilamentInstance::getSkinCount() const noexcept {
-    return downcast(this)->getSkinCount();
-}
+const char* FilamentInstance::getMaterialVariantName(size_t variantIndex) const noexcept { return mInstance->getMaterialVariantName(variantIndex); }
 
-const char* FilamentInstance::getSkinNameAt(size_t skinIndex) const noexcept {
-    return downcast(this)->getSkinNameAt(skinIndex);
-}
+void FilamentInstance::applyMaterialVariant(size_t variantIndex) noexcept { mInstance->applyMaterialVariant(variantIndex); }
 
-size_t FilamentInstance::getJointCountAt(size_t skinIndex) const noexcept {
-    return downcast(this)->getJointCountAt(skinIndex);
-}
+size_t FilamentInstance::getMaterialVariant() const noexcept { return mInstance->getMaterialVariant(); }
 
-const Entity* FilamentInstance::getJointsAt(size_t skinIndex) const noexcept {
-    return downcast(this)->getJointsAt(skinIndex);
-}
+Aabb FilamentInstance::getBoundingBox() const noexcept { return mInstance->getBoundingBox(); }
 
-void FilamentInstance::attachSkin(size_t skinIndex, Entity target) noexcept {
-    return downcast(this)->attachSkin(skinIndex, target);
-}
+size_t FilamentInstance::getMorphTargetCountAt(size_t index) const noexcept { return mInstance->getMorphTargetCountAt(index); }
 
-void FilamentInstance::detachSkin(size_t skinIndex, Entity target) noexcept {
-    return downcast(this)->detachSkin(skinIndex, target);
-}
+const char* FilamentInstance::getMorphTargetNameAt(size_t index, size_t targetIndex) const noexcept { return mInstance->getMorphTargetNameAt(index, targetIndex); }
 
-math::mat4f const* FilamentInstance::getInverseBindMatricesAt(size_t skinIndex) const {
-    return downcast(this)->getInverseBindMatricesAt(skinIndex);
-}
+void FilamentInstance::setMorphTargetWeightAt(size_t index, size_t targetIndex, float weight) { mInstance->setMorphTargetWeightAt(index, targetIndex, weight); }
 
-void FilamentInstance::recomputeBoundingBoxes() {
-    return downcast(this)->recomputeBoundingBoxes();
-}
+float FilamentInstance::getMorphTargetWeightAt(size_t index, size_t targetIndex) const noexcept { return mInstance->getMorphTargetWeightAt(index, targetIndex); }
 
-Aabb FilamentInstance::getBoundingBox() const noexcept {
-    return downcast(this)->mBoundingBox;
-}
+void FilamentInstance::setBoneTransform(size_t skinIndex, Entity jointEntity, const mat4f& transform) noexcept { mInstance->setBoneTransform(skinIndex, jointEntity, transform); }
 
 } // namespace filament::gltfio
