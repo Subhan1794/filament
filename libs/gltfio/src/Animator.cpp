@@ -34,6 +34,7 @@
 #include <math/vec3.h>
 #include <math/vec4.h>
 
+#include <cstring>
 #include <map>
 #include <string>
 #include <vector>
@@ -89,20 +90,26 @@ struct AnimatorImpl {
 };
 
 static void createSampler(const cgltf_animation_sampler& src, Sampler& dst) {
-    // Copy the time values into a red-black tree.
+    // Copy the time values into a red-black tree. Read each value with
+    // the accessor's byteStride: the stride defines the element layout,
+    // and reading the values tightly overruns the buffer view when
+    // byteStride is smaller than the element size. memcpy keeps the read
+    // alignment-safe for undersized strides.
     const cgltf_accessor* timelineAccessor = src.input;
     const uint8_t* timelineBlob = nullptr;
-    const float* timelineFloats = nullptr;
+    cgltf_size timelineBase = timelineAccessor->offset;
     if (timelineAccessor->buffer_view->has_meshopt_compression) {
         timelineBlob = (const uint8_t*) timelineAccessor->buffer_view->data;
-        timelineFloats = (const float*) (timelineBlob + timelineAccessor->offset);
     } else {
         timelineBlob = (const uint8_t*) timelineAccessor->buffer_view->buffer->data;
-        timelineFloats = (const float*) (timelineBlob + timelineAccessor->offset +
-                timelineAccessor->buffer_view->offset);
+        timelineBase += timelineAccessor->buffer_view->offset;
     }
+    const cgltf_size stride =
+            timelineAccessor->stride ? timelineAccessor->stride : sizeof(float);
     for (size_t i = 0, len = timelineAccessor->count; i < len; ++i) {
-        dst.times[timelineFloats[i]] = i;
+        float time = 0;
+        memcpy(&time, timelineBlob + timelineBase + i * stride, sizeof(float));
+        dst.times[time] = i;
     }   
     dst.inputCount = timelineAccessor->count;
     if (UTILS_UNLIKELY(dst.times.size() != dst.inputCount)) {
