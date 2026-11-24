@@ -19526,7 +19526,13 @@ namespace basist
 				return false;
 			}
 
-			if (m_header.m_sgd_byte_offset.get_uint64() + m_header.m_sgd_byte_length.get_uint64() > m_data_size)
+			// NB: do NOT add offset + length here. Both are attacker-controlled
+			// uint64 values, so the sum can wrap past m_data_size and pass this
+			// check. Check the offset first, then the length against the
+			// remaining file size, so no wrapping addition ever happens.
+			const uint64_t sgd_byte_offset = m_header.m_sgd_byte_offset.get_uint64();
+			const uint64_t sgd_byte_length = m_header.m_sgd_byte_length.get_uint64();
+			if ((sgd_byte_offset > m_data_size) || (sgd_byte_length > (m_data_size - sgd_byte_offset)))
 			{
 				BASISU_DEVEL_ERROR("ktx2_transcoder::init: Supercompression global data offset and/or length is too high\n");
 				return false;
@@ -19563,7 +19569,11 @@ namespace basist
 				BASISU_DEVEL_ERROR("ktx2_transcoder::init: Invalid level byte length\n");
 			}
 
-			if ((m_levels[i].m_byte_offset.get_uint64() + m_levels[i].m_byte_length.get_uint64()) > m_data_size)
+			// NB: same uint64 wrap hazard as the SGD check above: check the
+			// offset first, then the length against the remaining file size.
+			const uint64_t level_byte_offset = m_levels[i].m_byte_offset.get_uint64();
+			const uint64_t level_byte_length = m_levels[i].m_byte_length.get_uint64();
+			if ((level_byte_offset > m_data_size) || (level_byte_length > (m_data_size - level_byte_offset)))
 			{
 				BASISU_DEVEL_ERROR("ktx2_transcoder::init: Invalid level offset and/or length\n");
 				return false;
