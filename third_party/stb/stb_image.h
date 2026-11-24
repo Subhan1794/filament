@@ -6412,6 +6412,8 @@ static stbi_uc *stbi__gif_load_next(stbi__context *s, stbi__gif *g, int *comp, i
    first_frame = 0; 
    if (g->out == 0) {
       if (!stbi__gif_header(s, g, comp,0))     return 0; // stbi__g_failure_reason set by stbi__gif_header
+      if (!stbi__mad3sizes_valid(4, g->w, g->h, 0))
+         return stbi__errpuc("too large", "GIF image is too large");
       g->out = (stbi_uc *) stbi__malloc(4 * g->w * g->h);
       g->background = (stbi_uc *) stbi__malloc(4 * g->w * g->h); 
       g->history = (stbi_uc *) stbi__malloc(g->w * g->h); 
