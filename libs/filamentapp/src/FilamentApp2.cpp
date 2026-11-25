@@ -423,8 +423,7 @@ void FilamentApp2::captureScreenshot(utils::CString const& filepath) {
                 }
 
                 image::LinearImage image = image::toLinearWithAlpha<uint8_t>(
-                        state->width, state->height, state->width * 4, pixels,
-                        [](uint8_t v) { return v; }, image::sRGBToLinear<filament::math::float4>);
+                        state->width, state->height, state->width * 4, pixels);
 
                 std::ostringstream ss(std::ios::binary);
                 bool const encoded = imageio_lite::ImageEncoder::encode(ss,
@@ -717,6 +716,7 @@ bool FilamentApp2::doFrame() {
             mCurrentFrame++;
         } else {
             ++mSkippedFrames;
+            mDisplayManager->onFrameSkipped();
         }
 
 #ifdef __EXCEPTIONS

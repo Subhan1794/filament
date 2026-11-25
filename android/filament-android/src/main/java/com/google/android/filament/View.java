@@ -71,6 +71,7 @@ public class View {
     private @Nullable TemporalAntiAliasingOptions mTemporalAntiAliasingOptions;
     private @Nullable ScreenSpaceReflectionsOptions mScreenSpaceReflectionsOptions;
     private @Nullable GuardBandOptions mGuardBandOptions;
+    private @Nullable MotionVectorsOptions mMotionVectorsOptions;
     private @Nullable MultiSampleAntiAliasingOptions mMultiSampleAntiAliasingOptions;
     private @Nullable ColorGrading mColorGrading;
     private @Nullable AmbientOcclusionOptions mAmbientOcclusionOptions;
@@ -518,6 +519,30 @@ public class View {
     }
 
     /**
+     * Enables or disables tighter shadow caster culling for directional shadow maps.
+     *
+     * <p>Disabled by default. This can improve performance by culling shadow casters more
+     * aggressively against the view frustum silhouette.</p>
+     *
+     * <p><b>Warning:</b> We discourage enabling this option when using advanced shadow filtering
+     * techniques such as Variance Shadow Maps (VSM), DPCF, PCSS, or shadow mipmapping. Because
+     * these filtering techniques sample across wide spatial regions or large blur kernels, shadow
+     * casters physically outside the unblurred view silhouette volume may contribute soft shadow
+     * penumbras inside the visible screen boundary. Culling them can introduce shadow
+     * boundary/edge clipping artifacts.</p>
+     *
+     * @param enabled true enables tighter shadow caster culling, false disables it.
+     */
+    public void setTighterShadowCasterCullingEnabled(boolean enabled) {
+        nSetTighterShadowCasterCullingEnabled(getNativeObject(), enabled);
+    }
+
+    /** @return whether tighter shadow caster culling is enabled */
+    public boolean isTighterShadowCasterCullingEnabled() {
+        return nIsTighterShadowCasterCullingEnabled(getNativeObject());
+    }
+
+    /**
      * Enables or disables screen space refraction.
      *
      * <p>Enabled by default.</p>
@@ -694,6 +719,37 @@ public class View {
             mGuardBandOptions = new GuardBandOptions();
         }
         return mGuardBandOptions;
+    }
+
+    /**
+     * Enables or disables the motion vectors pass.
+     *
+     * <p>Disabled by default.</p>
+     *
+     * <p>Motion vectors are only generated when post-processing is enabled, stereo is disabled,
+     * the engine runs at feature level 1 or higher and the device supports RG16F render
+     * targets; otherwise this setting has no effect.</p>
+     *
+     * @param options motion vectors options
+     *
+     * @see MotionVectorsOptions
+     */
+    public void setMotionVectorsOptions(@NonNull MotionVectorsOptions options) {
+        mMotionVectorsOptions = options;
+        nSetMotionVectorsOptions(getNativeObject(), options.enabled);
+    }
+
+    /**
+     * Returns the motion vectors options.
+     *
+     * @return motion vectors options
+     */
+    @NonNull
+    public MotionVectorsOptions getMotionVectorsOptions() {
+        if (mMotionVectorsOptions == null) {
+            mMotionVectorsOptions = new MotionVectorsOptions();
+        }
+        return mMotionVectorsOptions;
     }
 
     /**
@@ -2065,7 +2121,9 @@ public class View {
             /** 16-samples of halton 2,3 */
             HALTON_23_X16,
             /** 32-samples of halton 2,3 */
-            HALTON_23_X32;
+            HALTON_23_X32,
+            /** Halton 2,3 scaled by upscaling^2 in [8, 128] samples */
+            HALTON_23_SCALED;
 
             public int toFilamentNative() { return ordinal(); }
         }
@@ -2325,6 +2383,23 @@ public class View {
         public boolean enabled = false;
     }
 
+    /**
+     * Options for the motion vectors pass.
+     *
+     * <p>Motion vectors are generated only when post-processing is enabled, stereo is disabled,
+     * the engine runs at feature level 1 or higher and the device supports RG16F render targets.
+     * They capture the rigid motion of renderables (TransformManager and InstanceBuffer transforms)
+     * and of the camera. Skinning/morphing deformation and the VIEW/DEVICE vertex domains are not
+     * captured.
+     * TAA uses motion vectors automatically when they are enabled.</p>
+     *
+     * @see View#setMotionVectorsOptions
+     */
+    public static class MotionVectorsOptions {
+        /** enables the motion vectors pass */
+        public boolean enabled = false;
+    }
+
     /** Options for stereoscopic (multi-eye) rendering. */
     public static class StereoscopicOptions {
         public boolean enabled = false;
@@ -2374,6 +2449,8 @@ public class View {
     private static native int nGetVisibleLayers(long nativeView);
     private static native void nSetShadowingEnabled(long nativeView, boolean enabled);
     private static native boolean nIsShadowingEnabled(long nativeView);
+    private static native void nSetTighterShadowCasterCullingEnabled(long nativeView, boolean enabled);
+    private static native boolean nIsTighterShadowCasterCullingEnabled(long nativeView);
     private static native void nSetScreenSpaceRefractionEnabled(long nativeView, boolean enabled);
     private static native boolean nIsScreenSpaceRefractionEnabled(long nativeView);
     private static native void nSetSampleCount(long nativeView, @IntRange(from = 0) int count);
@@ -2384,6 +2461,7 @@ public class View {
     private static native void nSetTemporalAntiAliasingOptions(long nativeView, float filterWidth, float feedback, float lodBias, float sharpness, boolean enabled, float upscaling, boolean filterHistory, boolean filterInput, boolean useYCoCg, boolean hdr, int boxType, int boxClipping, int jitterPattern, float varianceGamma, boolean preventFlickering, boolean historyReprojection, boolean motionAdaptiveHistory, float motionDeltaThreshold, float minBoxStrength, float minAlphaStrength, float skyDepthThreshold, float motionHoldFrames, boolean depthDisocclusion, float disocclusionDepthThreshold, boolean disocclusionHistoryNeighborhood, boolean exactLanczosSupport);
     private static native void nSetScreenSpaceReflectionsOptions(long nativeView, float thickness, float bias, float maxDistance, float stride, boolean enabled);
     private static native void nSetGuardBandOptions(long nativeView, boolean enabled);
+    private static native void nSetMotionVectorsOptions(long nativeView, boolean enabled);
     private static native void nSetMultiSampleAntiAliasingOptions(long nativeView, boolean enabled, int sampleCount, boolean customResolve);
     private static native void nSetColorGrading(long nativeView, long nativeColorGrading);
     private static native void nSetAmbientOcclusionOptions(long nativeView, int aoType, float radius, float power, float bias, float resolution, float intensity, float bilateralThreshold, int quality, int lowPassFilter, int upsampling, boolean enabled, boolean bentNormals, float minHorizonAngleRad, float ssctLightConeRad, float ssctShadowDistance, float ssctContactDistanceMax, float ssctIntensity, float ssctLightDirectionX, float ssctLightDirectionY, float ssctLightDirectionZ, float ssctDepthBias, float ssctDepthSlopeBias, int ssctSampleCount, int ssctRayCount, boolean ssctEnabled, int gtaoSampleSliceCount, int gtaoSampleStepsPerSlice, float gtaoThicknessHeuristic, boolean gtaoUseVisibilityBitmasks, float gtaoConstThickness, boolean gtaoLinearThickness);

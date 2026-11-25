@@ -62,6 +62,7 @@ set(SRCS
         src/materials/flare/flare.cpp
         src/materials/fog/fog.cpp
         src/materials/fsr/fsr.cpp
+        src/materials/motionVectors/motionVectors.cpp
         src/materials/sgsr/sgsr.cpp
         src/materials/ssao/ssao.cpp
         src/AtlasAllocator.cpp
@@ -154,6 +155,7 @@ set(SRCS
         src/ds/ColorPassDescriptorSet.cpp
         src/ds/DescriptorSet.cpp
         src/ds/DescriptorSetLayout.cpp
+        src/ds/MotionVectorsDescriptorSet.cpp
         src/ds/PostProcessDescriptorSet.cpp
         src/ds/ShadowMapDescriptorSet.cpp
         src/ds/SsrPassDescriptorSet.cpp
@@ -242,6 +244,7 @@ set(PRIVATE_HDRS
         src/downcast.h
         src/ds/ColorPassDescriptorSet.h
         src/ds/DescriptorSetLayout.h
+        src/ds/MotionVectorsDescriptorSet.h
         src/ds/PostProcessDescriptorSet.h
         src/ds/ShadowMapDescriptorSet.h
         src/ds/SsrPassDescriptorSet.h
@@ -266,6 +269,7 @@ set(PRIVATE_HDRS
         src/materials/fsr/ffx_a.h
         src/materials/fsr/ffx_fsr1.h
         src/materials/fsr/ffx_fsr1_mobile.fs
+        src/materials/motionVectors/motionVectors.h
         src/ZstdHelper.h
 )
 
@@ -315,6 +319,12 @@ set(MATERIAL_SRCS
         src/materials/ssao/saoBentNormals.mat
 )
 
+if (FILAMENT_SUPPORTS_MOTION_VECTORS)
+    list(APPEND MATERIAL_SRCS
+        src/materials/motionVectors/debugMotionVectors.mat
+    )
+endif()
+
 if (NOT FILAMENT_DISABLE_GTAO)
     list(APPEND MATERIAL_SRCS
         src/materials/ssao/gtao.mat
@@ -327,6 +337,15 @@ set(MATERIAL_MULTIVIEW_SRCS
         src/materials/defaultMaterial.mat
         src/materials/skybox.mat
 )
+
+set(MATERIAL_MULTIVIEW_ONLY_SRCS
+        src/materials/blitMultiview.mat
+)
+
+if (FILAMENT_ENABLE_MULTIVIEW)
+    list(APPEND MATERIAL_SRCS ${MATERIAL_MULTIVIEW_ONLY_SRCS})
+    list(APPEND MATERIAL_MULTIVIEW_SRCS ${MATERIAL_MULTIVIEW_ONLY_SRCS})
+endif()
 
 # This set of materials should only be compiled for vulkan or metal because they contain operations
 # not allowed on other platforms. (e.g. sampling from a multi-sampled texture).
@@ -464,7 +483,10 @@ foreach(mat_dir ${MATERIAL_DIRS})
             set(COMMENT_STR "Compiling material ${fullname} (Vulkan/Metal)")
         endif()
 
-        compile_material(${output_path} ${fullname} MATC_CUSTOM_FLAGS "${COMMENT_STR}")
+        check_in_list(MATERIAL_MULTIVIEW_ONLY_SRCS ${mat_src} is_multiview_only)
+        if (NOT is_multiview_only)
+            compile_material(${output_path} ${fullname} MATC_CUSTOM_FLAGS "${COMMENT_STR}")
+        endif()
 
         # --- Multiview variant ---
         check_in_list(MATERIAL_MULTIVIEW_SRCS ${mat_src} is_multiview)
@@ -760,13 +782,6 @@ if (MSVC)
 elseif (WASM)
     # Avoid strict-vtable-pointers here, it is broken in WebAssembly.
     set(OPTIMIZATION_FLAGS -fvisibility-inlines-hidden)
-elseif (FILAMENT_USING_GCC)
-    set(OPTIMIZATION_FLAGS
-        -ffast-math
-        -fno-finite-math-only
-        -ffp-contract=fast
-        -fvisibility-inlines-hidden
-    )
 else()
     set(OPTIMIZATION_FLAGS
         -ffast-math
@@ -775,7 +790,7 @@ else()
         # TODO: aggressive vectorization is currently broken on Android
         #        -fslp-vectorize-aggressive
         -fvisibility-inlines-hidden
-        -fstrict-vtable-pointers
+        $<$<CXX_COMPILER_ID:Clang,AppleClang>:-fstrict-vtable-pointers>
     )
 endif()
 

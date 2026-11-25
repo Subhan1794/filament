@@ -21,6 +21,7 @@
 #include "VulkanCommands.h"
 #include "VulkanConstants.h"
 #include "VulkanMemory.h"
+#include "VulkanSmallImagePool.h"
 #include "VulkanStagePool.h"
 
 #include "vulkan/memory/Resource.h"
@@ -75,7 +76,7 @@ private:
 
 struct VulkanTextureState : public fvkmemory::Resource {
     VulkanTextureState(VulkanStagePool& stagePool, VulkanCommands* commands, VmaAllocator allocator,
-            VkDevice device, VkImage image, VkDeviceMemory deviceMemory,
+            VkDevice device, VkImage image, VkDeviceMemory deviceMemory, VmaAllocation allocation,
             VkDeviceMemory stagingMemory, VkBuffer stagingBuffer, Platform::ExternalImageHandle ahBuffer,
             VkFormat format, VkImageViewType viewType, uint8_t levels, uint8_t layerCount,
             VkSamplerYcbcrConversion ycbcrConversion, VkImageUsageFlags usage, bool isProtected);
@@ -116,7 +117,13 @@ private:
     fvkmemory::resource_ptr<VulkanStream> mStream;
 
     VkImage const mTextureImage;
+
+    // At most one of these is set, and it means this texture owns the image:
+    //  - mTextureImageMemory: memory handed over with an internally created image.
+    //  - mTextureImageAllocation: memory allocated through VMA (user-facing textures).
+    // If neither is set, the image is owned elsewhere (e.g. swapchain images).
     VkDeviceMemory const mTextureImageMemory;
+    VmaAllocation const mTextureImageAllocation;
     VkFormat const mVkFormat;
     VkImageViewType const mViewType;
     VkImageSubresourceRange const mFullViewRange;
@@ -166,7 +173,7 @@ struct VulkanTexture : public HwTexture, fvkmemory::Resource {
             VmaAllocator allocator, fvkmemory::ResourceManager* resourceManager,
             VulkanCommands* commands, SamplerType target, uint8_t levels, TextureFormat tformat,
             uint8_t samples, uint32_t w, uint32_t h, uint32_t depth, TextureUsage tusage,
-            VulkanStagePool& stagePool);
+            VulkanStagePool& stagePool, VulkanSmallImagePool const& smallImagePool);
 
     // Specialized constructor for internally created textures (e.g. from a swap chain)
     VulkanTexture(VulkanContext const& context, VkDevice device, VmaAllocator allocator,

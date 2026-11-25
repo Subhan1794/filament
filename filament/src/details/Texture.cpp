@@ -559,6 +559,22 @@ void FTexture::setImageCommon(FEngine& engine, size_t const level,
         size_t const bpl = bpr * height; // TODO: PBD should have a "layer stride"
         // TODO: PBD should have a p.depth (# layers to skip)
 
+        // Vulkan's adjustedMemcpy infers the per-layer row count from the buffer
+        // (p.size / bpr / depth) and steps layers by that amount, while the check
+        // below assumes layers of exactly `height` rows. When the buffer holds more
+        // rows per layer than `height` and depth >= 2, the copy reads past the
+        // buffer even though the check below passes. Require the inferred layer
+        // height to cover the copied rows; this also promotes adjustedMemcpy's
+        // debug-only pbdHeight - top >= height assert to a release check.
+        size_t const inferredLayerHeight = bpr ? p.size / bpr / depth : 0;
+        FILAMENT_CHECK_PRECONDITION(p.top + height <= inferredLayerHeight)
+                << "buffer overflow: (size=" << size_t(p.size) << ", stride=" << size_t(p.stride)
+                << ", left=" << unsigned(p.left) << ", top=" << unsigned(p.top)
+                << ") smaller than specified region "
+                   "{{"
+                << unsigned(xoffset) << "," << unsigned(yoffset) << "," << unsigned(zoffset) << "},{"
+                << unsigned(width) << "," << unsigned(height) << "," << unsigned(depth) << "}}";
+
         /* Calculates the byte offset of the last pixel in a 3D sub-region. */
         auto const calculateLastPixelOffset = [bpp, bpr, bpl](
                 size_t xoff, size_t yoff, size_t zoff,
@@ -911,6 +927,8 @@ bool FTexture::validatePixelFormatAndType(TextureFormat const internalFormat,
     switch (internalFormat) {
         case TextureFormat::R8:
         case TextureFormat::R8_SNORM:
+        case TextureFormat::R16:
+        case TextureFormat::R16_SNORM:
         case TextureFormat::R16F:
         case TextureFormat::R32F:
             if (format != PixelDataFormat::R) {
@@ -931,6 +949,8 @@ bool FTexture::validatePixelFormatAndType(TextureFormat const internalFormat,
 
         case TextureFormat::RG8:
         case TextureFormat::RG8_SNORM:
+        case TextureFormat::RG16:
+        case TextureFormat::RG16_SNORM:
         case TextureFormat::RG16F:
         case TextureFormat::RG32F:
             if (format != PixelDataFormat::RG) {
@@ -955,6 +975,8 @@ bool FTexture::validatePixelFormatAndType(TextureFormat const internalFormat,
         case TextureFormat::SRGB8:
         case TextureFormat::RGB8_SNORM:
         case TextureFormat::R11F_G11F_B10F:
+        case TextureFormat::RGB16:
+        case TextureFormat::RGB16_SNORM:
         case TextureFormat::RGB16F:
         case TextureFormat::RGB32F:
             if (format != PixelDataFormat::RGB) {
@@ -979,6 +1001,8 @@ bool FTexture::validatePixelFormatAndType(TextureFormat const internalFormat,
         case TextureFormat::SRGB8_A8:
         case TextureFormat::RGBA8_SNORM:
         case TextureFormat::RGB10_A2:
+        case TextureFormat::RGBA16:
+        case TextureFormat::RGBA16_SNORM:
         case TextureFormat::RGBA16F:
         case TextureFormat::RGBA32F:
             if (format != PixelDataFormat::RGBA) {
@@ -1122,6 +1146,10 @@ bool FTexture::validatePixelFormatAndType(TextureFormat const internalFormat,
             }
             break;
 
+        case TextureFormat::R16:
+        case TextureFormat::RG16:
+        case TextureFormat::RGB16:
+        case TextureFormat::RGBA16:
         case TextureFormat::R16UI:
         case TextureFormat::RG16UI:
         case TextureFormat::RGB16UI:
@@ -1131,6 +1159,10 @@ bool FTexture::validatePixelFormatAndType(TextureFormat const internalFormat,
             }
             break;
 
+        case TextureFormat::R16_SNORM:
+        case TextureFormat::RG16_SNORM:
+        case TextureFormat::RGB16_SNORM:
+        case TextureFormat::RGBA16_SNORM:
         case TextureFormat::R16I:
         case TextureFormat::RG16I:
         case TextureFormat::RGB16I:

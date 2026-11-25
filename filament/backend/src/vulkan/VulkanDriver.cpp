@@ -158,12 +158,27 @@ VmaAllocator createAllocator(VkInstance instance, VkPhysicalDevice physicalDevic
         .vkCreateImage = vkCreateImage,
         .vkDestroyImage = vkDestroyImage,
         .vkCmdCopyBuffer = vkCmdCopyBuffer,
-        .vkGetBufferMemoryRequirements2KHR = vkGetBufferMemoryRequirements2KHR,
-        .vkGetImageMemoryRequirements2KHR = vkGetImageMemoryRequirements2KHR,
-        .vkGetPhysicalDeviceMemoryProperties2KHR = vkGetPhysicalDeviceMemoryProperties2KHR,
-        .vkGetPhysicalDeviceProperties2KHR = vkGetPhysicalDeviceProperties2KHR,
+        // With vulkanApiVersion 1.1, VMA reads the core 1.1 functions from these *KHR slots.
+        .vkGetBufferMemoryRequirements2KHR = vkGetBufferMemoryRequirements2,
+        .vkGetImageMemoryRequirements2KHR = vkGetImageMemoryRequirements2,
+        .vkBindBufferMemory2KHR = vkBindBufferMemory2,
+        .vkBindImageMemory2KHR = vkBindImageMemory2,
+        .vkGetPhysicalDeviceMemoryProperties2KHR = vkGetPhysicalDeviceMemoryProperties2,
+        .vkGetPhysicalDeviceProperties2KHR = vkGetPhysicalDeviceProperties2,
 #endif
     };
+
+    // Target Vulkan 1.1, Filament's minimum, so VMA honors the driver's dedicated allocation hints.
+    // Disabled on ARM for now: Mali only flags transient attachments, which are already dedicated,
+    // and on a Pixel 6 Pro the hints left 90-280 MB of unused VMA block space versus about 23 MB
+    // without them.
+    VkPhysicalDeviceProperties physicalDeviceProperties;
+    vkGetPhysicalDeviceProperties(physicalDevice, &physicalDeviceProperties);
+    bool const isARM = physicalDeviceProperties.vendorID == 0x13B5;
+    uint32_t const vmaApiVersion = isARM ? VK_API_VERSION_1_0
+                                         : VK_MAKE_API_VERSION(0, FVK_REQUIRED_VERSION_MAJOR,
+                                                   FVK_REQUIRED_VERSION_MINOR, 0);
+
     VmaAllocatorCreateInfo const allocatorInfo{
         // Disable the internal VMA synchronization because the backend is singled threaded.
         // Improve CPU performance when using VMA functions. The backend will guarantee that all
@@ -173,6 +188,7 @@ VmaAllocator createAllocator(VkInstance instance, VkPhysicalDevice physicalDevic
         .device = device,
         .pVulkanFunctions = &funcs,
         .instance = instance,
+        .vulkanApiVersion = vmaApiVersion,
     };
     vmaCreateAllocator(&allocatorInfo, &allocator);
     return allocator;
@@ -257,10 +273,11 @@ VulkanDriver::VulkanDriver(VulkanPlatform* platform, VulkanContext& context,
                   mPlatform->getGraphicsQueueFamilyIndex(), mPlatform->getProtectedGraphicsQueue(),
                   mPlatform->getProtectedGraphicsQueueFamilyIndex(), mContext, &mSemaphoreManager),
           mPipelineLayoutCache(mPlatform->getDevice()),
-          mPipelineCache(*this, mPlatform->getDevice(), mContext),
+          mPipelineCache(*this, *mPlatform, mContext),
           mStagePool(mAllocator, &mResourceManager, &mCommands, mPlatform->getPhysicalDevice(),
                   &mContext.getPhysicalDeviceLimits()),
           mBufferCache(mContext, mResourceManager, mAllocator),
+          mSmallImagePool(mAllocator, mContext),
           mFramebufferCache(mPlatform->getDevice(),
                   mPlatform->getCustomization().timeBeforeEvictionFbo),
           mYcbcrConversionCache(mPlatform->getDevice()),
@@ -271,7 +288,7 @@ VulkanDriver::VulkanDriver(VulkanPlatform* platform, VulkanContext& context,
                   [this](PixelBufferDescriptor&& pbd) { scheduleDestroy(std::move(pbd)); }),
           mDescriptorSetLayoutCache(mPlatform->getDevice(), &mResourceManager),
           mDescriptorSetCache(mPlatform->getDevice(), &mResourceManager),
-          mQueryManager(mPlatform->getDevice()),
+          mQueryManager(mContext, mPlatform->getDevice()),
           mExternalImageManager(&mSamplerCache, &mYcbcrConversionCache, &mDescriptorSetCache,
                   &mDescriptorSetLayoutCache),
           mStreamedImageManager(&mExternalImageManager),
@@ -435,6 +452,10 @@ void VulkanDriver::terminate() {
     mResourceManager.print();
 #endif
 
+    // All textures must have been destroyed by now so that their allocations have been returned to
+    // the pool. The pool must be destroyed before the allocator.
+    mSmallImagePool.terminate();
+
     vmaDestroyAllocator(mAllocator);
 
     if (mDebugCallback) {
@@ -461,10 +482,15 @@ void VulkanDriver::tick(int) {
     // If the Renderer is skipping a lot of frames, it's possible for
     // commands to accumulate, since we only flush command buffers if
     // driver.flush() is called, or in endFrame(). This ensures that
-    // flush and gc run regularly, even during skipped frames.
+    // flush and fence-gated handle reclamation run regularly during
+    // skipped frames without advancing the frame-count eviction timers
+    // in mPipelineCache, mFramebufferCache, mBufferCache, and mStagePool
+    // while in-flight frames are still executing on the GPU.
     if (++mTicksSinceLastGc == MAX_TICKS_BETWEEN_GC) {
         flush();
-        collectGarbage(); // Resets mTicksSinceLastGc to 0.
+        mCommands.gc();
+        mResourceManager.gc();
+        mTicksSinceLastGc = 0;
     }
 }
 
@@ -833,7 +859,7 @@ void VulkanDriver::createTextureCommon(Handle<HwTexture> th, SamplerType target,
         TextureUsage usage, bool asynchronous, utils::ImmutableCString&& tag) {
     auto texture = resource_ptr<VulkanTexture>::make(&mResourceManager, th, mPlatform->getDevice(),
             mPlatform->getPhysicalDevice(), mContext, mAllocator, &mResourceManager, &mCommands,
-            target, levels, format, samples, w, h, depth, usage, mStagePool);
+            target, levels, format, samples, w, h, depth, usage, mStagePool, mSmallImagePool);
 
     // Do transition to default layout.
     VulkanCommandBuffer& commandsBuf = mCommands.get();
@@ -860,7 +886,7 @@ void VulkanDriver::createTextureAsyncR(Handle<HwTexture> th, SamplerType target,
         void* user, utils::ImmutableCString&& tag) {
     FVK_SYSTRACE_SCOPE();
 
-    // This directly allocate GPU memory (not via VMA) and is executed on the backend thread for now.
+    // Executed on the backend thread for now.
     // NOTE: We could improve this by using the JobQueue in Phase 2.
     createTextureCommon(th, target, levels, format, samples, w, h, depth, usage,
             /* asynchronous = */ true, std::move(tag));
@@ -1173,7 +1199,8 @@ void VulkanDriver::createRenderTargetR(Handle<HwRenderTarget> rth,
 
     auto rt = resource_ptr<VulkanRenderTarget>::make(&mResourceManager, rth, mPlatform->getDevice(),
             mPlatform->getPhysicalDevice(), mContext, &mResourceManager, mAllocator, &mCommands,
-            width, height, samples, colorTargets, depthStencil, mStagePool, layerCount);
+            width, height, samples, colorTargets, depthStencil, mStagePool, mSmallImagePool,
+            layerCount);
     rt.inc();
 
     mResourceManager.associateHandle(rth.getId(), std::move(tag));
@@ -1449,7 +1476,7 @@ Handle<HwSwapChain> VulkanDriver::createSwapChainHeadlessS() noexcept {
 Handle<HwTimerQuery> VulkanDriver::createTimerQueryS() noexcept {
     // The handle must be constructed here, as a synchronous call to getTimerQueryValue might happen
     // before createTimerQueryR is executed.
-    auto query = mQueryManager.getNextQuery(&mResourceManager);
+    auto query = resource_ptr<VulkanTimerQuery>::construct(&mResourceManager);
     query.inc();
     return Handle<VulkanTimerQuery>(query.id());
 }
@@ -1485,6 +1512,7 @@ void VulkanDriver::destroySwapChain(Handle<HwSwapChain> sch) {
         return;
     }
     auto swapChain = resource_ptr<VulkanSwapChain>::cast(&mResourceManager, sch);
+
     if (mCurrentSwapChain == swapChain) {
         mCurrentSwapChain = {};
     }
@@ -1887,6 +1915,11 @@ bool VulkanDriver::isWorkaroundNeeded(Workaround workaround) {
             // early exit condition is flattened in EASU code
             return vendorId == 0x5143; // Qualcomm
         }
+        case Workaround::POWER_VR_SHADER_WORKAROUNDS: {
+            auto const vendorId = mContext.getPhysicalDeviceVendorId();
+            // textureGather is slow on PowerVR + Vulkan (tested on Pixel11).
+            return vendorId == 0x1010; // ImgTec (PowerVR)
+        }
         case Workaround::ALLOW_READ_ONLY_ANCILLARY_FEEDBACK_LOOP:
             // Supporting depth attachment as both sampler and attachment is only possible if we set
             // the depth attachment as read-only (e.g. during SSAO pass), however note that the
@@ -2153,12 +2186,14 @@ void VulkanDriver::setupExternalImage(void* image) {
 }
 
 TimerQueryResult VulkanDriver::getTimerQueryValue(Handle<HwTimerQuery> tqh, uint64_t* elapsedTime) {
-    auto vtq = resource_ptr<VulkanTimerQuery>::cast(&mResourceManager, tqh);
-    if (!vtq->isCompleted()) {
-        return TimerQueryResult::NOT_READY;
+    if (!tqh) {
+        return TimerQueryResult::ERROR;
     }
-
+    auto vtq = resource_ptr<VulkanTimerQuery>::cast(&mResourceManager, tqh);
     auto results = mQueryManager.getResult(vtq);
+    if (results.error) {
+        return TimerQueryResult::ERROR;
+    }
     if (results.beginAvailable == 0 || results.endAvailable == 0) {
         return TimerQueryResult::NOT_READY;
     }
@@ -2257,10 +2292,14 @@ void VulkanDriver::beginRenderPass(Handle<HwRenderTarget> rth, const RenderPassP
     // first render pass. Note however that its contents are often preserved on subsequent render
     // passes, due to multiple views.
     TargetBufferFlags discardStart = params.flags.discardStart;
+    fvkmemory::resource_ptr<VulkanSwapChain> swapchain;
     if (rt->isSwapChain()) {
-        fvkmemory::resource_ptr<VulkanSwapChain> sc = mCurrentSwapChain;
-        assert_invariant(sc);
-        if (sc->isFirstRenderPass()) {
+        // There should be no subpasses for the swapchain rendertarget. This is an assumption made
+        // to keep the swapchain FBO compatible without too much bookkeeping.
+        assert_invariant(params.subpassMask == 0);
+        swapchain = mCurrentSwapChain;
+        assert_invariant(swapchain);
+        if (swapchain->isFirstRenderPass()) {
             if (!acquireNextSwapchainImage()) {
                 // We've failed to acquire the next image. Subsequent calls cannot assume the render
                 // pass exists.
@@ -2268,7 +2307,7 @@ void VulkanDriver::beginRenderPass(Handle<HwRenderTarget> rth, const RenderPassP
                 return;
             } else {
                 discardStart |= TargetBufferFlags::COLOR;
-                sc->markFirstRenderPass();
+                swapchain->markFirstRenderPass();
             }
         }
     }
@@ -2344,8 +2383,21 @@ void VulkanDriver::beginRenderPass(Handle<HwRenderTarget> rth, const RenderPassP
 
     rt->emitBarriersBeginRenderPass(*commandBuffer);
 
-    fvkmemory::resource_ptr<VulkanFramebuffer> vkfb =
-            mFramebufferCache.getFramebuffer(fbkey, &mResourceManager, rt);
+    fvkmemory::resource_ptr<VulkanFramebuffer> vkfb;
+    if (swapchain) {
+        // Swapchain framebuffers are owned by the swapchain so that they are never evicted. One is
+        // reused for every render pass on a given image since those render passes are compatible.
+        vkfb = swapchain->getCurrentFramebuffer();
+        if (!vkfb) {
+            // Cached framebuffers retain the render target to keep their VkImageView cache keys
+            // valid. Swapchain framebuffers are uncached and cleared when attachments change, so
+            // they do not need a render target reference.
+            vkfb = mFramebufferCache.createFramebuffer(fbkey, &mResourceManager, {});
+            swapchain->setCurrentFramebuffer(vkfb);
+        }
+    } else {
+        vkfb = mFramebufferCache.getFramebuffer(fbkey, &mResourceManager, rt);
+    }
 
     // Assign a label to the framebuffer for debugging purposes.
 
@@ -3071,11 +3123,17 @@ void VulkanDriver::scissor(Viewport scissorBox) {
 }
 
 void VulkanDriver::beginTimerQuery(Handle<HwTimerQuery> tqh) {
+    if (!tqh) {
+        return;
+    }
     auto vtq = resource_ptr<VulkanTimerQuery>::cast(&mResourceManager, tqh);
     mQueryManager.beginQuery(&(mCommands.get()), vtq);
 }
 
 void VulkanDriver::endTimerQuery(Handle<HwTimerQuery> tqh) {
+    if (!tqh) {
+        return;
+    }
     auto vtq = resource_ptr<VulkanTimerQuery>::cast(&mResourceManager, tqh);
     mQueryManager.endQuery(&(mCommands.get()), vtq);
 }
@@ -3146,9 +3204,9 @@ bool VulkanDriver::acquireNextSwapchainImage() {
     }
 
     auto const [acquired, backingChanged] = mCurrentSwapChain->acquire();
+    // Note that the swapchain releases its own framebuffers when its backing images change, so
+    // the FBO cache does not need to be reset here.
     if (backingChanged) {
-        mFramebufferCache.resetFramebuffers();
-
         if (mPlatform->getCustomization().flushAndWaitOnWindowResize) {
             // In this scenario the command buffer was flushed, so we need
             // to set again the pipeline state and descriptor set state.

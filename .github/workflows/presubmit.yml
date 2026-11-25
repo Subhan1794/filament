@@ -13,46 +13,495 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# The conditional 'if' on each job is meant to skip presubmit jobs when a commit is pushed to main
-# and that commit is cryptographically "verified". Typically, a verified commit (like a GitHub UI
-# squash-and-merge) has already passed through presubmit during the Pull Request phase.
-# The conditional explicitly checks:
-# 1. always() && !cancelled(): Ensures the job runs even if 'check-verification' is skipped
-#    (which happens normally on PRs), but aborts if the workflow was manually cancelled.
-# 2. !needs.check-verification.outputs.skip: Evaluates to true when the 'skip' output is empty.
-#    The 'skip' output is only set to 'true' if it's a push to main AND the commit is verified.
-#    In all other cases (including PRs where the job is skipped), it defaults to empty.
+# The conditional 'if' on each job skips presubmit jobs when:
+# 1. A commit is pushed to main and is cryptographically "verified" (e.g., a GitHub UI
+#    squash-and-merge that already passed presubmit during the Pull Request phase), or
+# 2. The PR / commit only modifies files that do not affect that specific job, as classified by
+#    the 'check-verification' gate job.
+#
+# Skipping individual jobs via job-level 'if' conditions (rather than workflow-level 'paths'
+# filters) ensures GitHub reports each skipped job as 'skipped', which satisfies branch protection
+# required status checks instead of leaving them pending.
 
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
   check-verification:
-    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     outputs:
       skip: ${{ steps.check.outputs.skip }}
+      build-mac: ${{ steps.check.outputs.build-mac }}
+      build-linux: ${{ steps.check.outputs.build-linux }}
+      build-windows: ${{ steps.check.outputs.build-windows }}
+      build-android: ${{ steps.check.outputs.build-android }}
+      build-ios: ${{ steps.check.outputs.build-ios }}
+      build-web: ${{ steps.check.outputs.build-web }}
+      renderdiff-config: ${{ steps.check.outputs.renderdiff-config }}
+      renderdiff-run: ${{ steps.check.outputs.renderdiff-run }}
+      renderdiff-platforms: ${{ steps.check.outputs.renderdiff-platforms }}
+      renderdiff-accept: ${{ steps.check.outputs.renderdiff-accept }}
+      renderdiff-golden-branch: ${{ steps.check.outputs.renderdiff-golden-branch }}
+      code-correctness: ${{ steps.check.outputs.code-correctness }}
+      check-headers: ${{ steps.check.outputs.check-headers }}
+      test-backend: ${{ steps.check.outputs.test-backend }}
+      test-backend-metal: ${{ steps.check.outputs.test-backend-metal }}
     steps:
-      - name: Check commit verification
+      - name: Check commit verification and classify changed paths
         id: check
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
         with:
           script: |
-            const { data } = await github.rest.repos.getCommit({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              ref: context.sha
-            });
-            if (data.commit.verification.verified) {
-              core.setOutput('skip', 'true');
+            const RUN_ALL_LABEL = 'run all presubmits';
+            const { owner, repo } = context.repo;
+            let changedFiles = null;
+            let pushCommitMessage = '';
+
+            if (context.eventName === 'push') {
+              const { data } = await github.rest.repos.getCommit({
+                owner,
+                repo,
+                ref: context.sha,
+              });
+              if (data.commit.verification.verified) {
+                core.setOutput('skip', 'true');
+                core.setOutput('renderdiff-platforms', JSON.stringify(['desktop', 'web']));
+                core.setOutput('renderdiff-accept', 'false');
+                core.setOutput('renderdiff-golden-branch', 'main');
+                return;
+              }
+              pushCommitMessage = data.commit.message || '';
+              // GitHub's getCommit API caps the files list at 300 entries. If the commit
+              // touches fewer than 300 files and is not a file-less merge, we can classify
+              // its exact path list; otherwise fall back to running all jobs.
+              if (Array.isArray(data.files) && data.files.length > 0 && data.files.length < 300) {
+                changedFiles = data.files.map(f => f.filename);
+              }
+            } else if (context.eventName === 'pull_request') {
+              const pull_number = context.payload.pull_request.number;
+              const payloadLabels = (context.payload.pull_request.labels || []).map(l => l.name);
+              let runAll = payloadLabels.includes(RUN_ALL_LABEL);
+              if (!runAll) {
+                const { data: liveLabels } = await github.rest.issues.listLabelsOnIssue({
+                  owner,
+                  repo,
+                  issue_number: pull_number,
+                });
+                runAll = liveLabels.some(l => l.name === RUN_ALL_LABEL);
+              }
+              if (runAll) {
+                console.log(
+                  `PR #${pull_number} has the '${RUN_ALL_LABEL}' label. Enabling all presubmit jobs.`
+                );
+              } else {
+                const files = await github.paginate(github.rest.pulls.listFiles, {
+                  owner,
+                  repo,
+                  pull_number,
+                  per_page: 100,
+                });
+                changedFiles = files.map(f => f.filename);
+              }
             }
+
+            const globCache = new Map();
+            function globToRegExp(glob) {
+              let cached = globCache.get(glob);
+              if (cached) return cached;
+              let re = '^';
+              let inBraces = 0;
+              for (let i = 0; i < glob.length; i++) {
+                const c = glob[i];
+                if (c === '*') {
+                  if (glob[i + 1] === '*') {
+                    if (glob[i + 2] === '/') {
+                      re += '(?:.+/)?';
+                      i += 2;
+                    } else {
+                      re += '.*';
+                      i += 1;
+                    }
+                  } else {
+                    re += '[^/]*';
+                  }
+                } else if (c === '?') {
+                  re += '[^/]';
+                } else if (c === '{') {
+                  inBraces++;
+                  re += '(?:';
+                } else if (c === '}' && inBraces > 0) {
+                  inBraces--;
+                  re += ')';
+                } else if (c === ',' && inBraces > 0) {
+                  re += '|';
+                } else if ('\\.+$^()[]|'.includes(c)) {
+                  re += '\\' + c;
+                } else {
+                  re += c;
+                }
+              }
+              re += '$';
+              cached = new RegExp(re);
+              globCache.set(glob, cached);
+              return cached;
+            }
+
+            function matchesGlob(file, patterns) {
+              return patterns.some(p => globToRegExp(p).test(file));
+            }
+
+            // Inert files that never affect any presubmit build or test job.
+            // Stripping these first ensures that required edits like NEW_RELEASE_NOTES.md
+            // or documentation updates do not force unrelated platform builds to run.
+            const INERT_GLOBS = [
+              '**/*.md',
+              '.clang-format',
+              '.cursorrules',
+              '.dir-locals.el',
+              '.editorconfig',
+              '.gitignore',
+              'LICENSE',
+              '{art,docs,docs_src,ide,skills}/**',
+              '.github/workflows/{auto-close-restricted-paths,cocopods-deploy,codeql,npm-deploy,postsubmit*,release,renderdiff-goldens,status-*}.yml',
+            ];
+
+            function isInertFile(file) {
+              return matchesGlob(file, INERT_GLOBS);
+            }
+
+            const jobs = {
+              'build-mac': false,
+              'build-linux': false,
+              'build-windows': false,
+              'build-android': false,
+              'build-ios': false,
+              'build-web': false,
+              'renderdiff-config': false,
+              'renderdiff-desktop': false,
+              'renderdiff-web': false,
+              'code-correctness': false,
+              'check-headers': false,
+              'test-backend': false,
+              'test-backend-metal': false,
+            };
+
+            // Enables all jobs. Pass includeCheckHeaders = false for third_party/ fallback
+            // files so they do not trigger 'check-headers' while preserving an earlier true;
+            // the changedFiles === null fallback calls enableAll() with the default true.
+            function enableAll(includeCheckHeaders = true) {
+              for (const key of Object.keys(jobs)) {
+                // Skip rather than setting false so a prior non-third_party C/C++ file's true stands.
+                if (key === 'check-headers' && !includeCheckHeaders) continue;
+                jobs[key] = true;
+              }
+            }
+
+            function classifyFile(file) {
+              // third_party/ is exempt; the Check - header organization step filters
+              // third_party/ per file.
+              if (!file.startsWith('third_party/') && matchesGlob(file, ['**/*.{c,cpp,h,hpp}'])) {
+                jobs['check-headers'] = true;
+              }
+
+              // Android-isolated files (plus renderdiff schema validation for default_test.json)
+              if (file === 'android/samples/sample-render-validation/src/main/assets/default_test.json') {
+                jobs['build-android'] = true;
+                jobs['renderdiff-config'] = true;
+                return;
+              }
+              if (matchesGlob(file, [
+                'android/**',
+                'build/android/**',
+                'build/toolchain-*-linux-android.cmake',
+                'filament/backend/**/*Android*',
+                'filament/backend/**/VirtualMachineEnv.*',
+                'libs/utils/**/android/**',
+                'libs/filamentapp/**/*Android*',
+              ])) {
+                jobs['build-android'] = true;
+                return;
+              }
+
+              // iOS-isolated files (checked before Apple-shared *Cocoa* globs)
+              if (matchesGlob(file, [
+                'ios/**',
+                'build/ios/**',
+                'third_party/clang/{iOS,usage_ios_*}.cmake',
+                'filament/backend/**/*CocoaTouch*',
+              ])) {
+                jobs['build-ios'] = true;
+                return;
+              }
+
+              // macOS-only build scripts and backend test files
+              if (matchesGlob(file, ['build/mac/**'])) {
+                jobs['build-mac'] = true;
+                return;
+              }
+
+              // Apple-isolated files (macOS + iOS + Metal backend)
+              if (matchesGlob(file, [
+                '.github/actions/mac-prereq/**',
+                'build/common/get-ninja.sh',
+                'test/check-metal-shaders/**',
+                'filament/backend/src/metal/**',
+                'filament/backend/**/*{Metal,Apple,Cocoa}*',
+                'libs/utils/**/darwin/**',
+                'libs/{bluegl,bluevk,filamentapp}/**/*{Apple,Cocoa,Darwin}*',
+              ])) {
+                jobs['build-mac'] = true;
+                jobs['build-ios'] = true;
+                jobs['test-backend-metal'] = true;
+                return;
+              }
+
+              // Windows-isolated files
+              if (matchesGlob(file, [
+                'build/windows/**',
+                'filament/backend/**/*{Windows,WGL}*',
+                'libs/utils/**/win32/**',
+                'libs/{bluegl,bluevk,filamentapp}/**/*{Windows,win32}*',
+              ])) {
+                jobs['build-windows'] = true;
+                return;
+              }
+
+              // Web/WASM-isolated files
+              if (matchesGlob(file, [
+                'web/**',
+                'build/web/**',
+                'build/common/get-emscripten.sh',
+                '.github/actions/web-prereq/**',
+                'filament/backend/**/*{WebGL,Wasm}*',
+                'libs/utils/**/web/**',
+                'libs/filamentapp/**/*{Wasm,Emscripten,Html}*',
+                'libs/filamentapp/src/display_managers/web/**',
+              ])) {
+                jobs['build-web'] = true;
+                jobs['renderdiff-config'] = true;
+                jobs['renderdiff-web'] = true;
+                return;
+              }
+
+              // Linux-isolated build scripts and platform sources
+              if (matchesGlob(file, ['build/linux/{build,ci-common}.sh'])) {
+                jobs['build-linux'] = true;
+                return;
+              }
+              if (matchesGlob(file, [
+                'filament/backend/**/*Linux*',
+                'libs/{bluegl,filamentapp}/**/*Linux*',
+              ])) {
+                jobs['build-linux'] = true;
+                jobs['renderdiff-config'] = true;
+                jobs['renderdiff-desktop'] = true;
+                jobs['code-correctness'] = true;
+                jobs['test-backend'] = true;
+                return;
+              }
+
+              // Shared WebGPU backend & Dawn (only compiled where -W is passed in presubmit)
+              if (matchesGlob(file, [
+                'filament/backend/src/webgpu/**',
+                'filament/backend/**/*WebGPU*',
+                'third_party/dawn/**',
+              ])) {
+                jobs['build-linux'] = true;
+                jobs['build-web'] = true;
+                jobs['renderdiff-config'] = true;
+                jobs['renderdiff-desktop'] = true;
+                jobs['renderdiff-web'] = true;
+                jobs['code-correctness'] = true;
+                jobs['test-backend'] = true;
+                return;
+              }
+
+              // Renderdiff suite & glTF asset helpers
+              if (matchesGlob(file, ['test/renderdiff/{src/test_schema.py,tests/sample.json}'])) {
+                jobs['renderdiff-config'] = true;
+                return;
+              }
+              if (matchesGlob(file, [
+                '{test/renderdiff,test/render-validation,.github/actions/renderdiff,.github/actions/get-gltf-assets}/**',
+                'build/common/get-gltf-sample-assets.sh',
+              ])) {
+                jobs['renderdiff-config'] = true;
+                jobs['renderdiff-desktop'] = true;
+                jobs['renderdiff-web'] = true;
+                return;
+              }
+              if (matchesGlob(file, ['tools/diffimg/**'])) {
+                jobs['build-mac'] = true;
+                jobs['build-linux'] = true;
+                jobs['build-windows'] = true;
+                jobs['code-correctness'] = true;
+                jobs['renderdiff-config'] = true;
+                jobs['renderdiff-desktop'] = true;
+                jobs['renderdiff-web'] = true;
+                return;
+              }
+
+              // Mesa & Vulkan SDK CI actions (used only by Linux backend tests and desktop renderdiff)
+              if (matchesGlob(file, [
+                '.github/actions/get-{mesa,vulkan-sdk}/**',
+                'build/common/get-{mesa,vulkan-sdk}.sh',
+              ])) {
+                jobs['test-backend'] = true;
+                jobs['renderdiff-config'] = true;
+                jobs['renderdiff-desktop'] = true;
+                return;
+              }
+
+              // Backend test harness & sources
+              if (matchesGlob(file, ['test/backend/**'])) {
+                jobs['test-backend'] = true;
+                jobs['test-backend-metal'] = true;
+                return;
+              }
+              if (matchesGlob(file, ['filament/backend/test/**'])) {
+                jobs['build-mac'] = true;
+                jobs['build-linux'] = true;
+                jobs['code-correctness'] = true;
+                jobs['test-backend'] = true;
+                jobs['test-backend-metal'] = true;
+                if (file === 'filament/backend/test/test_ThreadPriorityOverride.cpp') {
+                  jobs['build-android'] = true;
+                }
+                return;
+              }
+
+              // Code correctness, header organization, and unit test suites
+              if (matchesGlob(file, [
+                'test/code-correctness/check-headers.sh',
+                'tools/reorganize-headers/**',
+              ])) {
+                jobs['check-headers'] = true;
+                return;
+              }
+              if (file === 'test/code-correctness/headers-inclusion.sh') {
+                jobs['build-linux'] = true;
+                return;
+              }
+              if (matchesGlob(file, ['test/{code-correctness,filament-unit-test}/**'])) {
+                jobs['code-correctness'] = true;
+                return;
+              }
+              if (matchesGlob(file, [
+                'filament/test/**',
+                '{libs,tools}/*/test/**',
+                '{libs,tools}/*/tests/**',
+              ])) {
+                jobs['build-mac'] = true;
+                jobs['build-linux'] = true;
+                jobs['build-windows'] = true;
+                jobs['code-correctness'] = true;
+                return;
+              }
+
+              // Desktop/Android samples and sample assets (excluded from default iOS, WASM,
+              // code-correctness unit tests, and backend test builds)
+              if (matchesGlob(file, ['{samples,assets}/**'])) {
+                jobs['build-mac'] = true;
+                jobs['build-linux'] = true;
+                jobs['build-windows'] = true;
+                jobs['build-android'] = true;
+                jobs['renderdiff-config'] = true;
+                jobs['renderdiff-desktop'] = true;
+                jobs['renderdiff-web'] = true;
+                return;
+              }
+
+              // Host tools: only tools built or exercised by unit tests need code-correctness.
+              if (matchesGlob(file, [
+                'tools/**',
+              ])) {
+                jobs['build-mac'] = true;
+                jobs['build-linux'] = true;
+                jobs['build-windows'] = true;
+                if (matchesGlob(file, ['tools/{cmgen,glslminifier,matc,resgen,uberz}/**'])) {
+                  jobs['code-correctness'] = true;
+                }
+                return;
+              }
+
+              // Unmatched third_party/ files still enable all build/test jobs, but skip
+              // 'check-headers' because third_party/ is exempt (preserving any prior true).
+              enableAll(!file.startsWith('third_party/'));
+            }
+
+            if (changedFiles === null) {
+              // File list unavailable; enable every job including 'check-headers'.
+              enableAll();
+            } else {
+              const activeFiles = changedFiles.filter(f => !isInertFile(f));
+              for (const file of activeFiles) {
+                classifyFile(file);
+              }
+            }
+
+            const renderdiffPlatforms = [];
+            if (jobs['renderdiff-desktop']) renderdiffPlatforms.push('desktop');
+            if (jobs['renderdiff-web']) renderdiffPlatforms.push('web');
+            const renderdiffRun = renderdiffPlatforms.length > 0;
+
+            // Parse RDIFF_ACCEPT_NEW_GOLDENS and RDIFF_BRANCH here (matching
+            // test/renderdiff/src/commit_msg.py) so test-renderdiff-platform can start immediately
+            // without waiting on a separate VM + checkout in renderdiff-config.
+            let renderdiffAccept = false;
+            let renderdiffGoldenBranch = 'main';
+            if (renderdiffRun || jobs['renderdiff-config']) {
+              let commitBodyText = pushCommitMessage;
+              if (context.eventName === 'pull_request') {
+                const pull_number = context.payload.pull_request.number;
+                const prCommits = await github.paginate(github.rest.pulls.listCommits, {
+                  owner,
+                  repo,
+                  pull_number,
+                  per_page: 100,
+                });
+                commitBodyText = prCommits
+                  .filter(c => (c.parents || []).length <= 1)
+                  .reverse()
+                  .map(c => c.commit.message || '')
+                  .join('\n\n');
+              }
+              const descLines = commitBodyText.split(/\r?\n/).slice(2).map(l => l.trim());
+              while (descLines.length > 0 && descLines[0].length === 0) {
+                descLines.shift();
+              }
+              renderdiffAccept = descLines.some(l => /^RDIFF_ACCEPT_NEW_GOLDENS$/.test(l));
+              for (const l of descLines) {
+                const m = l.match(/^RDIFF_BRANCH\s?=\s?([a-zA-Z0-9\s\-\/]+)/);
+                if (m) {
+                  renderdiffGoldenBranch = m[1].replace(/\s+/g, '') || 'main';
+                  break;
+                }
+              }
+            }
+
+            for (const [key, val] of Object.entries(jobs)) {
+              if (key === 'renderdiff-desktop' || key === 'renderdiff-web') continue;
+              core.setOutput(key, val ? 'true' : 'false');
+            }
+            core.setOutput('renderdiff-run', renderdiffRun ? 'true' : 'false');
+            core.setOutput('renderdiff-accept', renderdiffAccept ? 'true' : 'false');
+            core.setOutput('renderdiff-golden-branch', renderdiffGoldenBranch);
+            // Always emit a non-empty JSON array so GitHub Actions matrix evaluation
+            // never fails on an empty vector when test-renderdiff-platform is skipped.
+            core.setOutput(
+              'renderdiff-platforms',
+              JSON.stringify(renderdiffRun ? renderdiffPlatforms : ['desktop', 'web'])
+            );
 
   build-desktop-mac:
     name: build-mac
     runs-on: 'macos-15-xlarge'
     timeout-minutes: 45
     needs: [check-verification]
-    if: always() && !cancelled() && !needs.check-verification.outputs.skip
+    if: >
+      always() && !cancelled() && !needs.check-verification.outputs.skip
+      && needs.check-verification.outputs.build-mac == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -73,11 +522,13 @@ jobs:
     runs-on: 'arm-ubuntu-24.04-16core'
     timeout-minutes: 45
     needs: [check-verification]
-    if: always() && !cancelled() && !needs.check-verification.outputs.skip
+    if: >
+      always() && !cancelled() && !needs.check-verification.outputs.skip
+      && needs.check-verification.outputs.build-linux == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          fetch-depth: 0
+          fetch-depth: 1
           persist-credentials: false
       - uses: ./.github/actions/linux-prereq
       - uses: ./.github/actions/ccache
@@ -93,6 +544,12 @@ jobs:
       # already has the WebGPU backend and the WGSL code path in filamat.
       - name: Test - WGSL material compiler
         run: out/cmake-release/libs/filamat/test_filamat --gtest_filter=MaterialCompiler.Wgsl*
+      # Verify public header self-containment from the already-built release tree rather than
+      # compiling a duplicate release tree inside test-code-correctness.
+      - name: Check - public header inclusion
+        run: |
+          ninja -C out/cmake-release install
+          bash test/code-correctness/headers-inclusion.sh out/release/filament/include
       - uses: ./.github/actions/ccache-stats
         if: ${{ !cancelled() }}
 
@@ -100,7 +557,9 @@ jobs:
     name: build-windows
     runs-on: 'windows-2022'
     needs: [check-verification]
-    if: always() && !cancelled() && !needs.check-verification.outputs.skip
+    if: >
+      always() && !cancelled() && !needs.check-verification.outputs.skip
+      && needs.check-verification.outputs.build-windows == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -121,7 +580,9 @@ jobs:
     runs-on: 'ubuntu-24.04-8core'
     timeout-minutes: 45
     needs: [check-verification]
-    if: always() && !cancelled() && !needs.check-verification.outputs.skip
+    if: >
+      always() && !cancelled() && !needs.check-verification.outputs.skip
+      && needs.check-verification.outputs.build-android == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -169,7 +630,9 @@ jobs:
     runs-on: 'macos-15-xlarge'
     timeout-minutes: 45
     needs: [check-verification]
-    if: always() && !cancelled() && !needs.check-verification.outputs.skip
+    if: >
+      always() && !cancelled() && !needs.check-verification.outputs.skip
+      && needs.check-verification.outputs.build-ios == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -199,7 +662,9 @@ jobs:
     runs-on: 'arm-ubuntu-24.04-16core'
     timeout-minutes: 45
     needs: [check-verification]
-    if: always() && !cancelled() && !needs.check-verification.outputs.skip
+    if: >
+      always() && !cancelled() && !needs.check-verification.outputs.skip
+      && needs.check-verification.outputs.build-web == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -226,46 +691,21 @@ jobs:
       - uses: ./.github/actions/ccache-stats
         if: ${{ !cancelled() }}
 
-  # Cheap gate for test-renderdiff below. It exists so that the expensive job can be skipped whole
-  # rather than step by step: a RDIFF_ACCEPT_NEW_GOLDENS commit used to allocate the renderdiff
-  # runner and check the repository out only to do nothing, which is worth avoiding now that the
-  # runner is a paid one.
-  #
-  # The schema validation lives here for the same reason. It needs no build, only the glTF assets
-  # and under a second of Python, so a typo in a test JSON should fail within a minute rather than
-  # at the end of the longest job in the workflow.
+  # Fast schema validation for renderdiff JSON suites. Commit-message tags (RDIFF_BRANCH and
+  # RDIFF_ACCEPT_NEW_GOLDENS) are parsed directly in check-verification so test-renderdiff-platform
+  # can start immediately in parallel with this job instead of waiting on its checkout.
   renderdiff-config:
     name: renderdiff-config
     runs-on: 'ubuntu-24.04'
     needs: [check-verification]
-    if: always() && !cancelled() && !needs.check-verification.outputs.skip
-    outputs:
-      accept: ${{ steps.check_accept.outputs.accept }}
-      golden-branch: ${{ steps.check_accept.outputs.branch }}
+    if: >
+      always() && !cancelled() && !needs.check-verification.outputs.skip
+      && needs.check-verification.outputs.renderdiff-config == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          fetch-depth: 0
+          fetch-depth: 1
           persist-credentials: false
-      - id: get_commit_msg
-        uses: ./.github/actions/get-commit-msg
-      - name: Read the renderdiff commit message tags
-        id: check_accept
-        env:
-          COMMIT_MESSAGE: ${{ steps.get_commit_msg.outputs.msg }}
-        run: |
-          if echo "${COMMIT_MESSAGE}" | python3 test/renderdiff/src/commit_msg.py --mode=accept_new_goldens; then
-            echo "accept=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "accept=false" >> "$GITHUB_OUTPUT"
-          fi
-          # RDIFF_BRANCH, or "main" when the commit message does not name a branch. Whitespace is
-          # stripped because the tag is parsed out of free-form prose and a git ref cannot contain
-          # any: a line like "RDIFF_BRANCH=foo (see #123)" otherwise yields a trailing space, which
-          # the consumers of this output quote and pass through.
-          GOLDEN_BRANCH=$(echo "${COMMIT_MESSAGE}" | python3 test/renderdiff/src/commit_msg.py | tr -d '[:space:]')
-          echo "branch=${GOLDEN_BRANCH}" >> "$GITHUB_OUTPUT"
-        shell: bash
       # Needed by the validation below, not by this job's own logic: a gltf_test names its models
       # by bare name and the parser resolves each one against model_search_paths on disk, so a
       # tree without the downloaded assets reports every model in gltf/ as missing. This is a
@@ -300,28 +740,25 @@ jobs:
       # A desktop regression should not hide a web regression, or vice versa.
       fail-fast: false
       matrix:
-        platform: [desktop, web]
+        platform: ${{ fromJson(needs.check-verification.outputs.renderdiff-platforms) }}
     runs-on: 'arm-ubuntu-24.04-16core'
     # The web leg additionally builds wasm and renders through a software rasterizer in a browser,
     # which is substantially slower than rendering natively.
     timeout-minutes: ${{ matrix.platform == 'web' && 90 || 45 }}
-    needs: [check-verification, renderdiff-config]
-    # The first clause is the workflow-wide verified-commit convention documented at the top of
-    # this file. The second is this job's own: a gate that failed to parse the commit message has
-    # no branch name to offer, and rendering against the wrong goldens is worse than not rendering.
+    needs: [check-verification]
     if: >
       always() && !cancelled() && !needs.check-verification.outputs.skip
-      && needs.renderdiff-config.result == 'success'
-      && needs.renderdiff-config.outputs.accept != 'true'
+      && needs.check-verification.outputs.renderdiff-run == 'true'
+      && needs.check-verification.outputs.renderdiff-accept != 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          fetch-depth: 0
+          fetch-depth: 1
           persist-credentials: false
       - uses: ./.github/actions/renderdiff
         with:
           compare: 'true'
-          golden-branch: ${{ needs.renderdiff-config.outputs.golden-branch }}
+          golden-branch: ${{ needs.check-verification.outputs.renderdiff-golden-branch }}
           # The web build restores the cache the postsubmit build-web job writes, which also runs
           # this leg's build through generate.sh --build-only; the renderdiff action appends the
           # emsdk version.
@@ -347,13 +784,15 @@ jobs:
   #
   # It also merges the legs' outputs into the single presubmit-renderdiff-result artifact, because
   # tools outside this repository (filament-rdiff-server) expect a run to have exactly one
-  # renderdiff artifact. The legs write disjoint files apart from the golden checkout and the test
-  # config, which are identical in both.
+  # renderdiff artifact. Each leg downloads only its own platform's goldens, so the trees merge
+  # cleanly without uploading duplicate golden sets.
   test-renderdiff:
     name: test-renderdiff
     runs-on: 'ubuntu-24.04'
     needs: [check-verification, renderdiff-config, test-renderdiff-platform]
-    if: always() && !cancelled() && !needs.check-verification.outputs.skip
+    if: >
+      always() && !cancelled() && !needs.check-verification.outputs.skip
+      && needs.check-verification.outputs.renderdiff-config == 'true'
     steps:
       - name: Merge renderdiff output
         if: needs.test-renderdiff-platform.result != 'skipped'
@@ -367,11 +806,16 @@ jobs:
         if: ${{ !cancelled() }}
         env:
           CONFIG: ${{ needs.renderdiff-config.result }}
-          ACCEPT: ${{ needs.renderdiff-config.outputs.accept }}
+          ACCEPT: ${{ needs.check-verification.outputs.renderdiff-accept }}
+          RENDER_RUN: ${{ needs.check-verification.outputs.renderdiff-run }}
           LEGS: ${{ needs.test-renderdiff-platform.result }}
         run: |
           if [[ "${CONFIG}" == success && "${ACCEPT}" == true ]]; then
             echo "RDIFF_ACCEPT_NEW_GOLDENS is set; rendering was skipped."
+            exit 0
+          fi
+          if [[ "${CONFIG}" == success && "${RENDER_RUN}" != true ]]; then
+            echo "Only renderdiff schema validation was required; rendering was skipped."
             exit 0
           fi
           echo "renderdiff-config: ${CONFIG}, test-renderdiff-platform: ${LEGS}"
@@ -383,68 +827,90 @@ jobs:
     runs-on: 'arm-ubuntu-24.04-16core'
     timeout-minutes: 60
     needs: [check-verification]
-    if: always() && !cancelled() && !needs.check-verification.outputs.skip
+    if: >
+      always() && !cancelled() && !needs.check-verification.outputs.skip
+      && (needs.check-verification.outputs.code-correctness == 'true'
+          || needs.check-verification.outputs.check-headers == 'true')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: ./.github/actions/linux-prereq
-      # This job compiles two configurations, so it restores both caches into the same ccache
-      # directory. The two archives hold disjoint objects, because ccache keys on the full
-      # compiler command line and an asan object never shares a hash with a release one; the only
-      # files they have in common are the statistics counters, which the action zeroes anyway.
-      - uses: ./.github/actions/ccache
-        with:
-          config: desktop-release
-      - uses: ./.github/actions/ccache
-        with:
-          config: desktop-asan-debug
       - name: Get commit message
         id: get_commit_msg
+        if: needs.check-verification.outputs.check-headers == 'true'
         uses: ./.github/actions/get-commit-msg
+      # Run header organization before installing Linux packages or restoring compiler caches:
+      # it needs only Python 3 and fails within seconds on misordered includes, and when a PR only
+      # touches non-Linux C/C++ files (e.g. Android JNI), the rest of this job is skipped entirely.
       - name: Check - header organization
+        if: needs.check-verification.outputs.check-headers == 'true'
         env:
           COMMIT_MESSAGE: ${{ steps.get_commit_msg.outputs.msg }}
           GIHUB_SHA: ${{ github.sha }}
         run: |
+          FILES=()
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            FILES=()
-            while IFS= read -r -d '' file; do
-              FILES+=("$file")
-            done < <(git diff -z --name-only --diff-filter=d ${{ github.event.pull_request.base.sha }} ${{ github.event.pull_request.head.sha }})
-            if [ ${#FILES[@]} -gt 0 ]; then
-              bash test/code-correctness/check-headers.sh "${FILES[@]}"
-            else
-              echo "No files to check."
-            fi
+            DIFF_CMD=(
+              git diff -z --name-only --diff-filter=d
+              "${{ github.event.pull_request.base.sha }}"
+              "${{ github.event.pull_request.head.sha }}"
+              --
+            )
           else
-            bash test/code-correctness/check-headers.sh ${GITHUB_SHA}
+            DIFF_CMD=(
+              git diff-tree --no-commit-id -z --name-only --diff-filter=d -r
+              "${GITHUB_SHA}"
+              --
+            )
           fi
+          TMP_FILES=$(mktemp)
+          trap 'rm -f "$TMP_FILES"' EXIT
+          "${DIFF_CMD[@]}" > "$TMP_FILES" || exit $?
+          while IFS= read -r -d '' file; do
+            if [[ "$file" != third_party/* ]]; then
+              FILES+=("$file")
+            fi
+          done < "$TMP_FILES"
+          if [ ${#FILES[@]} -gt 0 ]; then
+            bash test/code-correctness/check-headers.sh "${FILES[@]}"
+          else
+            echo "No files to check."
+          fi
+      - uses: ./.github/actions/linux-prereq
+        if: needs.check-verification.outputs.code-correctness == 'true'
+      - uses: ./.github/actions/ccache
+        if: needs.check-verification.outputs.code-correctness == 'true'
+        with:
+          config: desktop-asan-debug
       - name: Run build script
+        if: needs.check-verification.outputs.code-correctness == 'true'
         # We need to build before clang-tidy can run analysis
         run: |
           # -b enables ASAN and UBSAN (Address and Undefined Behavior Sanitizers) for the debug build.
           # -d and -t compile matdbg and fgviewer, which build.sh otherwise always disables, so this
           # is the only presubmit build that covers them. Their servers only start when
           # FILAMENT_MATDBG_PORT or FILAMENT_FGVIEWER_PORT is set, so the unit tests below, which
-          # run against this tree, behave the same. The postsubmit desktop-asan-debug warmer must
-          # run this exact command for the cache to hit.
-          ./build.sh -b -d -t -p desktop debug
-          # This will build and install the release build. -W and -y none reproduce what
-          # build/linux/build.sh passes for a release-only build; they have to, because this build
-          # and build-linux share the desktop-release cache.
-          ./build.sh -W -y none -p desktop release && ninja -C out/cmake-release install
+          # run against this tree, behave the same. Build only matdbg, fgviewer, and the unit test
+          # binaries listed in test_list.txt (skipping ~35 sample binaries); the postsubmit
+          # desktop-asan-debug warmer runs this exact command.
+          ./build.sh -b -d -t -p desktop debug matdbg fgviewer $(bash test/filament-unit-test/test.sh --list-targets)
       - uses: ./.github/actions/ccache-stats
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && needs.check-verification.outputs.code-correctness == 'true' }}
       - name: Check - clang-tidy (exception escape)
-        run: bash test/code-correctness/clang-tidy-proxy.sh
-      - name: Check - public header inclusion
-        run: bash test/code-correctness/headers-inclusion.sh out/release/filament/include
-      - name: Check - Filament unit tests
+        if: needs.check-verification.outputs.code-correctness == 'true'
         run: |
-          # The tests that render, such as RenderingTest, use Mesa's software Vulkan driver.
-          sudo apt-get install -y libvulkan1 mesa-vulkan-drivers
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            CHANGED_LIST=$(mktemp)
+            git diff -z --name-only --diff-filter=d ${{ github.event.pull_request.base.sha }} ${{ github.event.pull_request.head.sha }} > "${CHANGED_LIST}"
+            bash test/code-correctness/clang-tidy-proxy.sh --changed_files_file "${CHANGED_LIST}"
+            rm -f "${CHANGED_LIST}"
+          else
+            bash test/code-correctness/clang-tidy-proxy.sh
+          fi
+      - name: Check - Filament unit tests
+        if: needs.check-verification.outputs.code-correctness == 'true'
+        run: |
           bash test/filament-unit-test/test.sh
 
   test-backend:
@@ -452,15 +918,16 @@ jobs:
     runs-on: 'arm-ubuntu-24.04-16core'
     timeout-minutes: 45
     needs: [check-verification]
-    if: always() && !cancelled() && !needs.check-verification.outputs.skip
+    if: >
+      always() && !cancelled() && !needs.check-verification.outputs.skip
+      && needs.check-verification.outputs.test-backend == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          fetch-depth: 0
+          fetch-depth: 1
           persist-credentials: false
       - uses: ./.github/actions/linux-prereq
       - uses: ./.github/actions/get-mesa
-      - uses: ./.github/actions/get-vulkan-sdk
       # Deliberately after get-mesa: meson picks ccache up automatically when it is on PATH, so
       # configuring CCACHE_DIR any earlier would let a Mesa rebuild (which only happens when the
       # Mesa cache misses) spend this job's cache budget on Mesa objects that no other job wants.
@@ -483,7 +950,9 @@ jobs:
     runs-on: 'macos-15'
     timeout-minutes: 60
     needs: [check-verification]
-    if: always() && !cancelled() && !needs.check-verification.outputs.skip
+    if: >
+      always() && !cancelled() && !needs.check-verification.outputs.skip
+      && needs.check-verification.outputs.test-backend-metal == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -511,8 +980,11 @@ jobs:
   test-backend-all:
     name: test-backend-all
     runs-on: 'ubuntu-24.04'
-    needs: [test-backend, test-backend-metal]
-    if: always() && !cancelled()
+    needs: [check-verification, test-backend, test-backend-metal]
+    if: >
+      always() && !cancelled() && !needs.check-verification.outputs.skip
+      && (needs.check-verification.outputs.test-backend == 'true'
+          || needs.check-verification.outputs.test-backend-metal == 'true')
     steps:
       - name: Check the backend job results
         shell: bash

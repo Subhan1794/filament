@@ -89,6 +89,7 @@ struct Material::BuilderDetails {
     const void* mPayload = nullptr;
     size_t mSize = 0;
     bool mDefaultMaterial = false;
+    bool mCopyPayload = true;
     int32_t mShBandsCount = 3;
     Builder::ShadowSamplingQuality mShadowSamplingQuality = Builder::ShadowSamplingQuality::LOW;
     UboBatchingMode mUboBatchingMode = UboBatchingMode::DEFAULT;
@@ -96,6 +97,10 @@ struct Material::BuilderDetails {
         CString,
         std::variant<int32_t, float, bool>> mConstantSpecializations;
 };
+
+FMaterial::StaticMaterialBuilder::StaticMaterialBuilder() {
+    mImpl->mCopyPayload = false;
+}
 
 FMaterial::DefaultMaterialBuilder::DefaultMaterialBuilder() {
     mImpl->mDefaultMaterial = true;
@@ -153,7 +158,7 @@ const char* toString(ShaderModel model) {
 
 Material* Material::Builder::build(Engine& engine) const {
     MaterialDefinition* r = downcast(engine).getMaterialCache().acquireMaterial(downcast(engine),
-            mImpl->mPayload, mImpl->mSize);
+            mImpl->mPayload, mImpl->mSize, mImpl->mCopyPayload);
     if (r) {
         return downcast(engine).createMaterial(*this, *r);
     }
@@ -175,6 +180,8 @@ FMaterial::FMaterial(FEngine& engine, const Builder& builder, MaterialDefinition
 
     mDepthPrecacheDisabled =
             driver.isWorkaroundNeeded(Workaround::DISABLE_DEPTH_PRECACHE_FOR_DEFAULT_MATERIAL);
+
+    mHasMotionVectorsVariant = computeHasMotionVectorsVariant();
 
     mPrograms.initializeForMaterial(engine, *this, processSpecializationConstants(builder));
 
@@ -236,6 +243,24 @@ filament::DescriptorSetLayout const& FMaterial::getPerViewDescriptorSetLayout(
     return mDefinition.perViewDescriptorSetLayoutPcf;
 }
 
+bool FMaterial::isValidProgram(Variant const variant, DynamicSpecConstKey const specKey,
+        ShaderModel const shaderModel, bool const isStereoSupported) const noexcept {
+    if (isSharedVariant(variant)) {
+        FMaterial const* const pDefaultMaterial = mEngine.getDefaultMaterial();
+        return pDefaultMaterial && pDefaultMaterial->getDefinition().isValidProgram(variant,
+                specKey, shaderModel, isStereoSupported);
+    }
+    return mDefinition.isValidProgram(variant, specKey, shaderModel, isStereoSupported);
+}
+
+bool FMaterial::computeHasMotionVectorsVariant() const noexcept {
+    // The SKN permutation isn't checked separately: it can only be missing with the `skinning`
+    // variant filter, and such materials already can't render skinned geometry in any pass.
+    return mDefinition.hasSurfaceVariants() &&
+           isValidProgram(Variant{ Variant::SPECIAL_MOT_VARIANT }, DynamicSpecConstKey{},
+                   mEngine.getShaderModel(), mEngine.isStereoSupported());
+}
+
 void FMaterial::compile(CompilerPriorityQueue const priority,
         UserVariantFilterMask variantSpec,
         CallbackHandler* handler,
@@ -275,7 +300,7 @@ void FMaterial::compile(CompilerPriorityQueue const priority,
         for (auto const variant : variants) {
             for (auto specKey : specKeys) {
                 specKey = mDefinition.filterProgramSpecKey(variant, specKey);
-                if (mDefinition.isValidProgram(variant, specKey, shaderModel, isStereoSupported)) {
+                if (isValidProgram(variant, specKey, shaderModel, isStereoSupported)) {
 #ifndef NDEBUG
                     FILAMENT_TRACING_EVENT(FILAMENT_TRACING_CATEGORY_FILAMENT,
                             "prepareProgram(variant found)",
@@ -349,7 +374,7 @@ FMaterialInstance* FMaterial::createInstance(const char* name) const noexcept {
 
 FMaterialInstance* FMaterial::getDefaultInstance() noexcept {
     if (UTILS_UNLIKELY(!mDefaultMaterialInstance)) {
-        mDefaultMaterialInstance = mEngine.createMaterialInstance(this, mDefinition.name.c_str());
+        mDefaultMaterialInstance = mEngine.createMaterialInstance(this, nullptr);
         mDefaultMaterialInstance->setDefaultInstance(true);
     }
     return mDefaultMaterialInstance;

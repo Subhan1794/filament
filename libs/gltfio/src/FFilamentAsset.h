@@ -46,9 +46,9 @@
 #include <math/mat4.h>
 
 #include <cgltf.h>
+#include <tsl/robin_map.h>
 
 #include <string>
-#include <unordered_map>
 #include <variant>
 #include <vector>
 
@@ -283,8 +283,13 @@ struct FFilamentAsset : public FilamentAsset {
     // Indicates if resource decoding has started (not necessarily finished)
     bool mResourcesLoaded = false;
 
+    // Indicates that ResourceLoader::loadResources() succeeded, which means that the source buffers
+    // have been loaded and validated. Unlike mResourcesLoaded, this remains false when loading
+    // fails, in which case the source buffers must not be read (e.g. by the Animator).
+    bool mResourcesValid = false;
+
     DependencyGraph mDependencyGraph;
-    std::unordered_map<std::string, std::vector<utils::Entity>> mNameToEntity;
+    tsl::robin_map<std::string, std::vector<utils::Entity>> mNameToEntity;
     utils::CString mAssetExtras;
     bool mDetachedFilamentComponents = false;
 
@@ -436,7 +441,7 @@ private:
         }
     };
     // Lookup map cache mapping (gltfTextureIndex, flags) to its resolved assetTextureIndex.
-    std::unordered_map<TextureKey, size_t, TextureKeyHash> mResolvedTextures;
+    tsl::robin_map<TextureKey, size_t, TextureKeyHash> mResolvedTextures;
 };
 
 FILAMENT_DOWNCAST(FilamentAsset)

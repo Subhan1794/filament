@@ -378,6 +378,12 @@ Filament.loadClassExtensions = function() {
         this._setGuardBandOptions(options);
     };
 
+    /// setMotionVectorsOptions ::method::
+    Filament.View.prototype.setMotionVectorsOptions = function(overrides) {
+        const options = this.setMotionVectorsOptionsDefaults(overrides);
+        this._setMotionVectorsOptions(options);
+    };
+
     /// setStereoscopicOptions ::method::
     Filament.View.prototype.setStereoscopicOptions = function(overrides) {
         const options = this.setStereoscopicOptionsDefaults(overrides);
@@ -617,6 +623,9 @@ Filament.loadClassExtensions = function() {
         buffer = getBufferDescriptor(buffer);
         const asset = this._createInstancedAsset(buffer, instances.length);
         buffer.delete();
+        if (!asset) {
+            return null;
+        }
         const instancesVector = asset._getAssetInstances();
         for (let i = 0; i < instancesVector.size(); i++) {
             instances[i] = instancesVector.get(i);

@@ -7,6 +7,62 @@ A new header is inserted each time a *tag* is created.
 Instead, if you are authoring a PR for the main branch, add your release note to
 [NEW_RELEASE_NOTES.md](./NEW_RELEASE_NOTES.md).
 
+## v1.81.1
+
+- utils: `bitset` is no longer over-aligned to 16 bytes, which fixes a crash (SIGBUS) creating
+  Vulkan descriptor-set layouts on 32-bit ARM
+
+## v1.81.0
+
+- backend: added 16-bit normalized texture formats (`R16`, `RG16`, `RGB16`, `RGBA16`, and `*_SNORM`).
+- webgpu: preserve fragment depth writes and discard in depth-only render passes (#10717).
+- gltf: `KHR_materials_iridescence` is now supported
+- gltf: `KHR_materials_anisotropy` is now supported
+- gltf: `KHR_materials_diffuse_transmission` is now supported
+- materials: the new `diffuseTransmission` and `diffuseTransmissionColor` material properties can be
+  used in the lit (standard) shading model to create diffusely transmitting (translucent) surfaces
+- variant: completely remove FOG variant bit
+- android: `Engine.destroySwapChain()` releases the `ANativeWindow` taken from a `Surface`, fixing a
+  file descriptor leak. It now waits for the driver thread to run pending commands before returning.
+- opengl: key the program binary cache on the final shader source instead of the user material
+  code; remove the `MAT_UUID` material chunk. [⚠️ **Recompile Materials**]
+- engine: fix `RenderTarget` validation rejecting layers of 2D-array textures at mip levels above 0
+  (the layer count was halved per level as for 3D textures)
+- gltfio: lit materials without clear coat use ubershaders built without the clear coat lobe
+- metal: map the `SRGB8_ALPHA8_ASTC_*` texture formats to Metal's sRGB ASTC pixel formats on
+  Apple-family GPUs (they previously had no Metal mapping)
+- gl: on PowerVR Rogue GE9215, material-instance uniforms are no longer batched and buffer updates
+  no longer go through `glMapBufferRange`
+
+## v1.80.1
+
+- engine: fix PCSS soft shadows of point and spot lights using the directional light's bulb radius
+- engine: fix a shader program leak when rendering PCSS or VSM shadows with the program cache
+  disabled
+- vulkan: with the `backend.vulkan.enable_pipeline_cache_persistence` feature flag, the backend
+  keeps its `VkPipelineCache` across runs through `Platform::setBlobFunc`, as the GL backend does
+  for program binaries; the blob functions must be set before the `Engine` is created
+- materials: the new `retroreflection` material property can be used in the lit (standard) shading
+  model to create retroreflective surfaces
+- gltf: `KHR_materials_retroreflection` is now supported
+
+## v1.80.0
+
+- filamat: convert FOG variant into a specialization constant. [⚠️ **Recompile Materials**]
+- engine: in `AsynchronousMode::AMORTIZATION`, queued async operations now run at the end of each
+  frame and in `Renderer::skipFrame()`, within a per-frame time budget set by the new
+  `Engine::Config::asynchronousFrameBudget` (2 ms by default), instead of 5 operations per backend
+  tick. Metal now runs them every frame too
+- java: `Engine.Config.asynchronousFrameBudget` (in nanoseconds) is added
+- web: `Engine$Config.asynchronousFrameBudgetMs` is added
+- vulkan: fix a crash when more than 32 timer queries are outstanding. `createTimerQueryS` returns
+  a null handle once the pool is exhausted, and `getTimerQueryValue` reports `ERROR` for it
+  (#10658)
+- engine: add `View::setMotionVectorsOptions()`, which renders the motion vectors of moving
+  objects. TAA uses them to reproject these objects, which reduces ghosting. Disabled by default
+- materials: add the `motionVectors` variant filter (`UserVariantFilterBit::MOTION_VECTORS`), which
+  removes the new motion vectors depth variants. `UserVariantFilterBit::ALL` is now `0x1FF` [⚠️ **Recompile Materials**]
+
 ## v1.79.0
 
 - java: Fixed support for quaternions in JNI bindings

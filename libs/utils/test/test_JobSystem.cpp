@@ -140,9 +140,13 @@ TEST(JobSystem, WorkStealingDequeue_PushPopSteal) {
     int steal1 = 0;
     int steal2 = 0;
     int steal3 = 0;
+    std::atomic<int> ready{ 0 };
 
     size_t push_size = size;
     std::thread push_pop_thread([&]() {
+        ready.fetch_add(1, std::memory_order_acq_rel);
+        while (ready.load(std::memory_order_acquire) < 5) {
+        }
         for (int i=0 ; i<push_size/4 ; i++) {
             queue.push(&pJob);
             queue.push(&pJob);
@@ -162,24 +166,36 @@ TEST(JobSystem, WorkStealingDequeue_PushPopSteal) {
 
     size_t steal_size = size;
     std::thread steal_thread0([&]() {
+        ready.fetch_add(1, std::memory_order_acq_rel);
+        while (ready.load(std::memory_order_acquire) < 5) {
+        }
         for (int i=0 ; i<steal_size ; i++) {
             if (queue.steal())
                 steal0++;
         }
     });
     std::thread steal_thread1([&]() {
+        ready.fetch_add(1, std::memory_order_acq_rel);
+        while (ready.load(std::memory_order_acquire) < 5) {
+        }
         for (int i=0 ; i<steal_size ; i++) {
             if (queue.steal())
                 steal1++;
         }
     });
     std::thread steal_thread2([&]() {
+        ready.fetch_add(1, std::memory_order_acq_rel);
+        while (ready.load(std::memory_order_acquire) < 5) {
+        }
         for (int i=0 ; i<steal_size ; i++) {
             if (queue.steal())
                 steal2++;
         }
     });
     std::thread steal_thread3([&]() {
+        ready.fetch_add(1, std::memory_order_acq_rel);
+        while (ready.load(std::memory_order_acquire) < 5) {
+        }
         for (int i=0 ; i<steal_size ; i++) {
             if (queue.steal())
                 steal3++;
@@ -580,9 +596,9 @@ TEST(JobSystem, JobSystemDelegates) {
     js.runAndWait(job);
     EXPECT_EQ(3, functor.result);
 
-    size_t a=0,b=0,c=0,d=0,e=0;
-    job = js.createJob(nullptr, [&functor, a,b,c](JobSystem&, JobSystem::Job*){
-        functor.result = 4;
+    size_t a = 1, b = 1, c = 1, d = 1, e = 0;
+    job = js.createJob(nullptr, [&functor, a, b, c, d, e](JobSystem&, JobSystem::Job*) {
+        functor.result = int(a + b + c + d + e);
     });
     js.runAndWait(job);
     EXPECT_EQ(4, functor.result);
@@ -1364,6 +1380,32 @@ TEST(JobSystem, JobPoolExhaustionNullJobRun) {
     ASSERT_NE(nextJob, nullptr);
     js.runAndWait(nextJob);
     EXPECT_TRUE(executed.load());
+
+    js.emancipate();
+}
+
+TEST(JobSystem, JobPoolFullOfChildren) {
+    JobSystem js(JobSystem::SINGLE_THREADED);
+    js.adopt();
+
+    // The parent's running count reaches MAX_JOB_COUNT (itself plus every other job).
+    size_t executed = 0;
+    JobSystem::Job* parent = js.createJob();
+    std::vector<JobSystem::Job*> children;
+    children.reserve(JobSystem::MAX_JOB_COUNT);
+    JobSystem::Job* child = nullptr;
+    while ((child = js.createJob(parent, [&executed](JobSystem&, JobSystem::Job*) {
+        executed++;
+    })) != nullptr) {
+        children.push_back(child);
+    }
+    ASSERT_EQ(children.size(), JobSystem::MAX_JOB_COUNT - 1);
+
+    for (auto* c : children) {
+        js.run(c);
+    }
+    js.runAndWait(parent);
+    EXPECT_EQ(executed, children.size());
 
     js.emancipate();
 }

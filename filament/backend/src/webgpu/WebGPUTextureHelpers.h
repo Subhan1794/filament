@@ -24,6 +24,8 @@
 #include <backend/platforms/WebGPUWasmPolyfill.h>
 #endif
 
+#include <utils/debug.h>
+
 #include <webgpu/webgpu_cpp.h>
 
 #include <string_view>
@@ -42,6 +44,18 @@ namespace filament::backend {
            textureFormat == wgpu::TextureFormat::Depth24Plus ||
            textureFormat == wgpu::TextureFormat::Depth24PlusStencil8 ||
            textureFormat == wgpu::TextureFormat::Depth32FloatStencil8;
+}
+
+/**
+ * @return true if the format is a 32-bit float color format, which can only be linearly filtered
+ *         (i.e. used with a wgpu::TextureSampleType::Float binding) when the device has the
+ *         wgpu::FeatureName::Float32Filterable feature.
+ *         See https://www.w3.org/TR/webgpu/#float32-filterable
+ */
+[[nodiscard]] constexpr bool isFloat32ColorFormat(wgpu::TextureFormat const format) {
+    return format == wgpu::TextureFormat::R32Float ||
+           format == wgpu::TextureFormat::RG32Float ||
+           format == wgpu::TextureFormat::RGBA32Float;
 }
 
 [[nodiscard]] constexpr bool isUIntFormat(const wgpu::TextureFormat format) {
@@ -255,11 +269,14 @@ namespace filament::backend {
         case TextureFormat::RGB32F:                  return wgpu::TextureFormat::RGBA32Float;
         case TextureFormat::RGB32UI:                 return wgpu::TextureFormat::RGBA32Uint;
         case TextureFormat::RGB32I:                  return wgpu::TextureFormat::RGBA32Sint;
-        case TextureFormat::DXT1_RGB:                return wgpu::TextureFormat::BC1RGBAUnorm;
+        // WebGPU has no 3-channel BC1 format. BC1RGBAUnorm decodes selector 3 of a 3-color block
+        // (color0 <= color1) as transparent black (A=0) instead of opaque black (A=1), so these
+        // formats are rejected, as on Metal.
+        case TextureFormat::DXT1_RGB:                return wgpu::TextureFormat::Undefined;
         case TextureFormat::DXT1_RGBA:               return wgpu::TextureFormat::BC1RGBAUnorm;
         case TextureFormat::DXT3_RGBA:               return wgpu::TextureFormat::BC2RGBAUnorm;
         case TextureFormat::DXT5_RGBA:               return wgpu::TextureFormat::BC3RGBAUnorm;
-        case TextureFormat::DXT1_SRGB:               return wgpu::TextureFormat::BC1RGBAUnormSrgb;
+        case TextureFormat::DXT1_SRGB:               return wgpu::TextureFormat::Undefined;
         case TextureFormat::DXT1_SRGBA:              return wgpu::TextureFormat::BC1RGBAUnormSrgb;
         case TextureFormat::DXT3_SRGBA:              return wgpu::TextureFormat::BC2RGBAUnormSrgb;
         case TextureFormat::DXT5_SRGBA:              return wgpu::TextureFormat::BC3RGBAUnormSrgb;
@@ -276,6 +293,15 @@ namespace filament::backend {
         case TextureFormat::RGBA4:
             FWGPU_LOGW << "Requested Filament texture format RGBA4 but getting "
                           "wgpu::TextureFormat::Undefined (no direct mapping in wgpu)";
+            return wgpu::TextureFormat::Undefined;
+        case TextureFormat::R16:
+        case TextureFormat::R16_SNORM:
+        case TextureFormat::RG16:
+        case TextureFormat::RG16_SNORM:
+        case TextureFormat::RGB16:
+        case TextureFormat::RGB16_SNORM:
+        case TextureFormat::RGBA16:
+        case TextureFormat::RGBA16_SNORM:
             return wgpu::TextureFormat::Undefined;
     }
 }
@@ -442,6 +468,14 @@ namespace filament::backend {
     }
 }
 
+/**
+ * @return true if the format is a block-compressed texture format (BC, ETC2/EAC, or ASTC).
+ */
+[[nodiscard]] constexpr bool isCompressedTextureFormat(wgpu::TextureFormat const format) {
+    wgpu::Extent2D const blockSize = getBlockSize(format);
+    return blockSize.width > 1 || blockSize.height > 1;
+}
+
 [[nodiscard]] constexpr size_t getWGPUTextureFormatPixelSize(const wgpu::TextureFormat format) {
     switch (format) {
         // 1 byte
@@ -562,6 +596,7 @@ namespace filament::backend {
 
 /**
  * @param fUsage Filament's requested texture usage
+ * @param fFormat Filament's requested texture format
  * @param samples How many samples to use for MSAA
  * @param needsComputeStorageSupport if we need to use this texture as storage binding in something
  *                                   like a compute shader
@@ -571,7 +606,7 @@ namespace filament::backend {
  * @return The appropriate texture usage flags for the underlying texture
  */
 [[nodiscard]] constexpr wgpu::TextureUsage fToWGPUTextureUsage(TextureUsage const& fUsage,
-        const uint8_t samples, const bool needsComputeStorageSupport,
+        const TextureFormat fFormat, const uint8_t samples, const bool needsComputeStorageSupport,
         const bool needsRenderAttachmentSupport, const bool deviceSupportsTransientAttachments) {
     wgpu::TextureUsage retUsage{ wgpu::TextureUsage::None };
 
@@ -603,6 +638,7 @@ namespace filament::backend {
     wgpu::TextureUsage transientAttachmentNeeded{ wgpu::TextureUsage::None };
     bool const useTransientAttachment =
             deviceSupportsTransientAttachments &&
+            !isCompressedFormat(fFormat) &&
             // Usage consists of attachment flags only.
             none(fUsage & ~TextureUsage::ALL_ATTACHMENTS) &&
             // Usage contains at least one attachment flag.
@@ -641,6 +677,30 @@ namespace filament::backend {
         retUsage |= wgpu::TextureUsage::RenderAttachment;
         retUsage |= transientAttachmentNeeded;
     }
+
+    // WebGPU forbids compressed formats from being used as render attachments or storage
+    // bindings (see https://www.w3.org/TR/webgpu/#abstract-opdef-validating-gputexturedescriptor).
+    // Uploads to compressed textures never require a conversion blit (see conversionNecessary()),
+    // so these usages, which may have been added implicitly above (e.g. for UPLOADABLE), are never
+    // needed and must be removed for the texture descriptor to be valid.
+    if (isCompressedFormat(fFormat)) {
+        wgpu::TextureUsage disallowed =
+                wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::StorageBinding;
+#if !defined(__EMSCRIPTEN__)
+        disallowed |= wgpu::TextureUsage::TransientAttachment;
+#endif
+        retUsage &= ~disallowed;
+    }
+
+#if !defined(__EMSCRIPTEN__)
+    // TransientAttachment is a Dawn native extension rather than a core W3C WebGPU
+    // GPUTextureUsageFlags bit (see https://www.w3.org/TR/webgpu/#typedefdef-gputextureusageflags).
+    // Dawn's specification requires TransientAttachment to be paired with another attachment usage
+    // (RenderAttachment here, since StorageAttachment is unused) and forbids using it alone:
+    // https://dawn.googlesource.com/dawn/+/refs/heads/main/docs/dawn/features/transient_attachments.md
+    assert_invariant(!(retUsage & wgpu::TextureUsage::TransientAttachment) ||
+                     bool(retUsage & wgpu::TextureUsage::RenderAttachment));
+#endif
 
     // NOTE: Unused wgpu flags:
     //  StorageAttachment

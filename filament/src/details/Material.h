@@ -68,7 +68,12 @@ public:
             MaterialDefinition const& definition);
     ~FMaterial() noexcept;
 
-    class DefaultMaterialBuilder : public Builder {
+    class StaticMaterialBuilder : public Builder {
+    public:
+        StaticMaterialBuilder();
+    };
+
+    class DefaultMaterialBuilder : public StaticMaterialBuilder {
     public:
         DefaultMaterialBuilder();
     };
@@ -185,6 +190,12 @@ public:
 
     bool isDefaultMaterial() const noexcept { return mIsDefaultMaterial; }
 
+    // Returns true if this material can render the motion vectors variant (DEP | MOT). Materials
+    // that use the shared depth programs report the default material's answer. Materials without
+    // it (e.g. built with the `motionVectors` variant filter) must be drawn depth-only in the
+    // motion vectors pass, i.e. with a motion vector of zero.
+    bool hasMotionVectorsVariant() const noexcept { return mHasMotionVectorsVariant; }
+
     backend::descriptor_binding_t getSamplerBinding(
             std::string_view const& name) const;
 
@@ -220,16 +231,17 @@ public:
     }
 
     std::string_view getSource() const noexcept {
-        return mDefinition.source.c_str_safe();
+        return mDefinition.getSource().c_str_safe();
     }
 
     inline bool isSharedVariant(Variant const variant) const {
-        // The default material explicitly filters VSM variants to reduce binary size, so it cannot
-        // provide the MNT | DEP variant as a shared program.
-        return !mIsDefaultMaterial && !mDefinition.hasCustomDepthShader &&
-               mDefinition.isValidDepthVariant(variant) &&
-               !mDefinition.isDepthMomentsVariant(variant);
+        return mDefinition.isSharedVariant(variant, mIsDefaultMaterial);
     }
+
+    // Like MaterialDefinition::isValidProgram(), except that a shared variant is checked against
+    // the default material, whose programs render it (see isSharedVariant()).
+    bool isValidProgram(Variant variant, DynamicSpecConstKey specKey,
+            backend::ShaderModel shaderModel, bool isStereoSupported) const noexcept;
 
     MaterialParser const& getMaterialParser() const noexcept {
 #if FILAMENT_ENABLE_MATDBG
@@ -287,12 +299,15 @@ private:
         backend::CallbackHandler* handler,
         utils::Invocable<void(Material*)>&& callback) noexcept;
 
+    bool computeHasMotionVectorsVariant() const noexcept;
+
     MaterialDefinition const& mDefinition;
 
     bool mIsDefaultMaterial = false;
 
     bool mUseUboBatching = false;
     bool mDepthPrecacheDisabled = false;
+    bool mHasMotionVectorsVariant = false;
 
     // reserve some space to construct the default material instance
     FMaterialInstance* mDefaultMaterialInstance = nullptr;

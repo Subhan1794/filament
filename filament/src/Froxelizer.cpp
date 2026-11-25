@@ -58,6 +58,7 @@
 #include <cmath>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <type_traits>
 #include <utility>
 
@@ -144,8 +145,7 @@ View::FroxelConfigurationInfo Froxelizer::getFroxelConfigurationInfo() const noe
 }
 
 Froxelizer::Froxelizer(FEngine& engine)
-    : mArena("froxel", PER_FROXELDATA_ARENA_SIZE),
-      mZLightNear(FROXEL_FIRST_SLICE_DEPTH_DEFAULT),
+    : mZLightNear(FROXEL_FIRST_SLICE_DEPTH_DEFAULT),
       mZLightFar(FROXEL_LAST_SLICE_DISTANCE_DEFAULT),
       mUserZLightNear(FROXEL_FIRST_SLICE_DEPTH_DEFAULT),
       mUserZLightFar(FROXEL_LAST_SLICE_DISTANCE_DEFAULT) {
@@ -167,22 +167,31 @@ Froxelizer::Froxelizer(FEngine& engine)
     size_t const froxelRecordBufferByteCount = getFroxelRecordBufferByteCount(driverApi);
     mFroxelRecordBufferEntryCount = froxelRecordBufferByteCount / sizeof(uint8_t);
     assert_invariant(mFroxelRecordBufferEntryCount <= size_t(std::numeric_limits<uint16_t>::max()) + 1);
-
-    mRecordsBuffer = driverApi.createBufferObject(
-            froxelRecordBufferByteCount,
-            BufferObjectBinding::UNIFORM, BufferUsage::DYNAMIC);
-
-    mFroxelsBuffer = driverApi.createBufferObject(
-            froxelBufferByteCount,
-            BufferObjectBinding::UNIFORM, BufferUsage::DYNAMIC);
 }
 
 Froxelizer::~Froxelizer() {
     // make sure we called terminate()
 }
 
+void Froxelizer::ensureBuffersCreated(DriverApi& driverApi) noexcept {
+    if (UTILS_UNLIKELY(driverApi.getFeatureLevel() == FeatureLevel::FEATURE_LEVEL_0)) {
+        return;
+    }
+    if (UTILS_UNLIKELY(!mRecordsBuffer)) {
+        mRecordsBuffer = driverApi.createBufferObject(
+                getFroxelRecordBufferByteCount(driverApi),
+                BufferObjectBinding::UNIFORM, BufferUsage::DYNAMIC);
+    }
+    if (UTILS_UNLIKELY(!mFroxelsBuffer)) {
+        mFroxelsBuffer = driverApi.createBufferObject(
+                getFroxelBufferByteCount(driverApi),
+                BufferObjectBinding::UNIFORM, BufferUsage::DYNAMIC);
+    }
+}
+
 void Froxelizer::terminate(DriverApi& driverApi) noexcept {
     resetLocalArena();
+    mArena.reset();
 
     if (mRecordsBuffer) {
         driverApi.destroyBufferObject(mRecordsBuffer);
@@ -435,12 +444,14 @@ bool Froxelizer::update() noexcept {
 
         if (mDistancesZ) {
             resetLocalArena();
+        } else if (UTILS_UNLIKELY(!mArena.has_value())) {
+            mArena.emplace("froxel", PER_FROXELDATA_ARENA_SIZE);
         }
 
-        mDistancesZ      = mArena.alloc<float>(froxelCountZ + 1);
-        mPlanesX         = mArena.alloc<float4>(froxelCountX + 1);
-        mPlanesY         = mArena.alloc<float4>(froxelCountY + 1);
-        mBoundingSpheres = mArena.alloc<float4>(froxelCount);
+        mDistancesZ      = mArena->alloc<float>(froxelCountZ + 1);
+        mPlanesX         = mArena->alloc<float4>(froxelCountX + 1);
+        mPlanesY         = mArena->alloc<float4>(froxelCountY + 1);
+        mBoundingSpheres = mArena->alloc<float4>(froxelCount);
         mFroxelCountX = froxelCountX;
         mFroxelCountY = froxelCountY;
         mFroxelCountZ = froxelCountZ;
@@ -556,15 +567,18 @@ bool Froxelizer::update() noexcept {
 
 UTILS_NOINLINE
 void Froxelizer::resetLocalArena() noexcept {
-    mArena.free(mDistancesZ, (mFroxelCountZ + 1) * sizeof(float));
-    mArena.free(mPlanesX, (mFroxelCountX + 1) * sizeof(float4));
-    mArena.free(mPlanesY, (mFroxelCountY + 1) * sizeof(float4));
-    mArena.free(mBoundingSpheres, mFroxelCount * sizeof(float4));
-    mArena.reset();
-    mBoundingSpheres = nullptr;
-    mPlanesY = nullptr;
-    mPlanesX = nullptr;
-    mDistancesZ = nullptr;
+    if (mDistancesZ) {
+        assert_invariant(mArena.has_value());
+        mArena->free(mDistancesZ, (mFroxelCountZ + 1) * sizeof(float));
+        mArena->free(mPlanesX, (mFroxelCountX + 1) * sizeof(float4));
+        mArena->free(mPlanesY, (mFroxelCountY + 1) * sizeof(float4));
+        mArena->free(mBoundingSpheres, mFroxelCount * sizeof(float4));
+        mArena->reset();
+        mBoundingSpheres = nullptr;
+        mPlanesY = nullptr;
+        mPlanesX = nullptr;
+        mDistancesZ = nullptr;
+    }
 }
 
 Froxel Froxelizer::getFroxelAt(size_t const x, size_t const y, size_t const z) const noexcept {
@@ -612,6 +626,7 @@ std::pair<size_t, size_t> Froxelizer::clipToIndices(float2 const& clip) const no
 
 
 void Froxelizer::commit(DriverApi& driverApi, LinearAllocatorArena& arena) {
+    assert_invariant(mFroxelsBuffer && mRecordsBuffer);
     // send data to GPU
     driverApi.updateBufferObject(mFroxelsBuffer,
             { mFroxelBufferUser.data(), mFroxelBufferEntryCount * sizeof(FroxelEntry) }, 0);

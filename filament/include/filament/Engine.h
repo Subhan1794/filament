@@ -391,9 +391,10 @@ public:
         uint32_t resourceAllocatorCacheSizeMB = 64;
 
         /*
-         * This value determines how many frames texture entries are kept for in the cache. This
-         * is a soft limit, meaning some texture older than this are allowed to stay in the cache.
-         * Typically only one texture is evicted per frame.
+         * This value determines how many frames unused texture entries are kept in the cache.
+         * Entries older than resourceAllocatorCacheMaxAge are subject to a soft limit where
+         * typically one texture is evicted per frame, while entries older than
+         * resourceAllocatorCacheMaxAge + 2 frames are unconditionally evicted.
          * The default is 1.
          */
         uint32_t resourceAllocatorCacheMaxAge = 1;
@@ -1282,6 +1283,31 @@ public:
     void flush();
 
     /**
+     * Runs one amortized garbage-collection cycle on the Engine's internal component managers,
+     * scenes, and deferred asynchronous destructions, and advances the EntityManager epoch so
+     * destroyed entity IDs can be recycled.
+     *
+     * <p>This is called automatically by Renderer::endFrame() and Renderer::skipFrame(), so
+     * applications using a standard beginFrame() / endFrame() loop do not need to call it.
+     * Applications that render exclusively via Renderer::renderStandaloneView(), or that create
+     * and destroy entities without a Renderer frame loop, should call gc() periodically (for
+     * example, once per iteration of their loop) to prevent entity ID exhaustion and component
+     * memory growth.</p>
+     *
+     * @note
+     * Must be called from the Engine's main thread, outside of any
+     * Renderer::beginFrame() / Renderer::endFrame() block.
+     *
+     * @note
+     * Calling gc() invalidates all component Instance handles held from TransformManager,
+     * RenderableManager, LightManager, and CameraManager.
+     *
+     * @see Renderer::renderStandaloneView()
+     * @see Renderer::endFrame()
+     */
+    void gc();
+
+    /**
      * Get paused state of rendering thread.
      *
      * <p>Warning: This is an experimental API.
@@ -1469,8 +1495,8 @@ public:
     /**
      * Asynchronously ensures that the variants of the specified Material needed to render it
      * in the provided View are compiled. This takes into account the view's features
-     * (e.g. dynamic lighting, fog, stereo, shadowing), alongside the specified shadow receiver
-     * and skinning configurations.
+     * (e.g. dynamic lighting, fog, stereo, shadowing, motion vectors), alongside the specified
+     * shadow receiver and skinning configurations.
      *
      * After issuing several Engine::compile() calls in a row, it is recommended to call
      * Engine::flush() such that the backend can start the compilation work as soon as possible.

@@ -95,6 +95,8 @@ option(FILAMENT_SUPPORTS_WEBP_TEXTURES "Enable webp texture support for Filament
 # On the regular filament build (where size is of less concern), we enable GTAO by default.
 option(FILAMENT_DISABLE_GTAO "Disable GTAO" OFF)
 
+option(FILAMENT_SUPPORTS_MOTION_VECTORS "Enable motion vectors support" ON)
+
 option(FILAMENT_BUILD_TESTING "Build tests" ON)
 
 option(FILAMENT_DEBUG_MUTEX "Enable utils::Mutex lock order and deadlock debugging" OFF)
@@ -481,7 +483,9 @@ if (LINUX)
             link_libraries(libc++.a)
             link_libraries(libc++abi.a)
         else()
-            set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -static")
+            set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++ -static")
+            link_libraries("-lc++")
+            link_libraries("-lc++abi")
         endif()
     endif()
 
@@ -540,7 +544,7 @@ endif()
 # Debug compiler flags
 # ==================================================================================================
 if (FILAMENT_ENABLE_ASAN_UBSAN)
-   set(EXTRA_SANITIZE_OPTIONS "-fsanitize=address -fsanitize=undefined")
+   set(EXTRA_SANITIZE_OPTIONS "-fsanitize=address -fsanitize=undefined -O1 -fno-omit-frame-pointer -Wno-pass-failed")
 endif()
 if (FILAMENT_ENABLE_TSAN)
    set(EXTRA_SANITIZE_OPTIONS "-fsanitize=thread")
@@ -579,6 +583,13 @@ endif()
 # See: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=ffcf9c5700e49c0aee42dcba9a12ba21338e8136
 if (LINUX)
     set(NO_EXEC_STACK "-Wl,-z,noexecstack")
+    if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        include(CheckLinkerFlag)
+        check_linker_flag(CXX "-fuse-ld=lld" FILAMENT_HAS_LLD)
+        if (FILAMENT_HAS_LLD)
+            set(LINKER_LLD "-fuse-ld=lld")
+        endif()
+    endif()
 endif()
 
 set(B_SYMBOLIC_FUNCTIONS "-Wl,-Bsymbolic-functions")
@@ -599,8 +610,8 @@ if (APPLE)
     set(CMAKE_CXX_ARCHIVE_CREATE "<CMAKE_AR> qc -S <TARGET> <LINK_FLAGS> <OBJECTS>")
 endif()
 
-set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${GC_SECTIONS} ${NO_EXEC_STACK}")
-set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${GC_SECTIONS} ${B_SYMBOLIC_FUNCTIONS} ${BINARY_ALIGNMENT}")
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${GC_SECTIONS} ${NO_EXEC_STACK} ${LINKER_LLD}")
+set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${GC_SECTIONS} ${B_SYMBOLIC_FUNCTIONS} ${BINARY_ALIGNMENT} ${LINKER_LLD}")
 
 if (WASM_PTHREADS)
     set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -pthread")
@@ -714,6 +725,9 @@ endif()
 # Target system.
 if (IS_MOBILE_TARGET)
     set(MATC_TARGET mobile)
+elseif (FILAMENT_SUPPORTS_EGL_ON_LINUX)
+    # EGL on Linux runs the GLES backend: needs the mobile shaders too
+    set(MATC_TARGET all)
 else()
     set(MATC_TARGET desktop)
 endif()
@@ -744,6 +758,12 @@ if (FILAMENT_DISABLE_MATOPT)
 endif()
 
 set(MATC_BASE_FLAGS ${MATC_API_FLAGS} -p ${MATC_TARGET} ${MATC_OPT_FLAGS})
+
+if (FILAMENT_SUPPORTS_MOTION_VECTORS)
+    add_definitions(-DFILAMENT_SUPPORTS_MOTION_VECTORS)
+else()
+    set(MATC_BASE_FLAGS ${MATC_BASE_FLAGS} -V motionVectors)
+endif()
 
 # ==================================================================================================
 # Distribution
@@ -1079,7 +1099,6 @@ if (IS_HOST_PLATFORM)
     add_subdirectory(${TOOLS}/rgb-to-lmsr)
     add_subdirectory(${TOOLS}/roughness-prefilter)
     add_subdirectory(${TOOLS}/specular-color)
-    add_subdirectory(${TOOLS}/taa)
     add_subdirectory(${TOOLS}/uberz)
     add_subdirectory(${TOOLS}/specgen)
 endif()

@@ -90,37 +90,11 @@ bool isTransientUsage(wgpu::TextureUsage usage) {
  */
 [[nodiscard]] constexpr wgpu::TextureFormat storageBindingCompatibleFormatForViewFormat(
         const wgpu::TextureFormat viewFormat) {
-    switch (viewFormat) {
-        case wgpu::TextureFormat::RGBA8UnormSrgb:      return wgpu::TextureFormat::RGBA8Unorm;
-        case wgpu::TextureFormat::BGRA8UnormSrgb:      return wgpu::TextureFormat::BGRA8Unorm;
-        case wgpu::TextureFormat::BC1RGBAUnormSrgb:    return wgpu::TextureFormat::BC1RGBAUnorm;
-        case wgpu::TextureFormat::BC2RGBAUnormSrgb:    return wgpu::TextureFormat::BC2RGBAUnorm;
-        case wgpu::TextureFormat::BC3RGBAUnormSrgb:    return wgpu::TextureFormat::BC3RGBAUnorm;
-        case wgpu::TextureFormat::BC7RGBAUnormSrgb:    return wgpu::TextureFormat::BC7RGBAUnorm;
-        case wgpu::TextureFormat::ETC2RGB8UnormSrgb:   return wgpu::TextureFormat::ETC2RGB8Unorm;
-        case wgpu::TextureFormat::ETC2RGB8A1UnormSrgb: return wgpu::TextureFormat::ETC2RGB8A1Unorm;
-        case wgpu::TextureFormat::ETC2RGBA8UnormSrgb:  return wgpu::TextureFormat::ETC2RGBA8Unorm;
-        case wgpu::TextureFormat::ASTC4x4UnormSrgb:    return wgpu::TextureFormat::ASTC4x4Unorm;
-        case wgpu::TextureFormat::ASTC5x4UnormSrgb:    return wgpu::TextureFormat::ASTC5x4Unorm;
-        case wgpu::TextureFormat::ASTC5x5UnormSrgb:    return wgpu::TextureFormat::ASTC5x5Unorm;
-        case wgpu::TextureFormat::ASTC6x5UnormSrgb:    return wgpu::TextureFormat::ASTC6x5Unorm;
-        case wgpu::TextureFormat::ASTC6x6UnormSrgb:    return wgpu::TextureFormat::ASTC6x6Unorm;
-        case wgpu::TextureFormat::ASTC8x5UnormSrgb:    return wgpu::TextureFormat::ASTC8x5Unorm;
-        case wgpu::TextureFormat::ASTC8x6UnormSrgb:    return wgpu::TextureFormat::ASTC8x6Unorm;
-        case wgpu::TextureFormat::ASTC8x8UnormSrgb:    return wgpu::TextureFormat::ASTC8x8Unorm;
-        case wgpu::TextureFormat::ASTC10x5UnormSrgb:   return wgpu::TextureFormat::ASTC10x5Unorm;
-        case wgpu::TextureFormat::ASTC10x6UnormSrgb:   return wgpu::TextureFormat::ASTC10x6Unorm;
-        case wgpu::TextureFormat::ASTC10x8UnormSrgb:   return wgpu::TextureFormat::ASTC10x8Unorm;
-        case wgpu::TextureFormat::ASTC10x10UnormSrgb:  return wgpu::TextureFormat::ASTC10x10Unorm;
-        case wgpu::TextureFormat::ASTC12x10UnormSrgb:  return wgpu::TextureFormat::ASTC12x10Unorm;
-        case wgpu::TextureFormat::ASTC12x12UnormSrgb:  return wgpu::TextureFormat::ASTC12x12Unorm;
-        default:
-            if (isFormatStorageCompatible(viewFormat)) {
-                return viewFormat; // view format is itself already storage binding compatible
-            } else {
-                return wgpu::TextureFormat::Undefined; // no valid format in this case
-            }
+    wgpu::TextureFormat const linearFormat = toLinearFormat(viewFormat);
+    if (isFormatStorageCompatible(linearFormat)) {
+        return linearFormat;
     }
+    return wgpu::TextureFormat::Undefined;
 }
 
 [[nodiscard]] wgpu::TextureAspect fToWGPUTextureViewAspect(TextureUsage const& fUsage,
@@ -160,14 +134,14 @@ bool isTransientUsage(wgpu::TextureUsage usage) {
 }
 
 [[nodiscard]] WebGPUTexture::MipmapGenerationStrategy determineMipmapGenerationStrategy(
-        const wgpu::TextureFormat format, const SamplerType samplerType, const uint8_t sampleCount,
-        const uint8_t mipmapLevels) {
+        wgpu::TextureFormat const format, SamplerType const samplerType, uint8_t const sampleCount,
+        uint8_t const mipmapLevels, bool const float32Filterable) {
     if (mipmapLevels <= 1) {
         return WebGPUTexture::MipmapGenerationStrategy::NONE; // no mipmap generation needed
     }
     const WebGPURenderPassMipmapGenerator::FormatCompatibility renderPassCompatibility{
         WebGPURenderPassMipmapGenerator::getCompatibilityFor(format,
-                toWebGPUTextureDimension(samplerType), sampleCount)
+                toWebGPUTextureDimension(samplerType), sampleCount, float32Filterable)
     };
     if (renderPassCompatibility.compatible) {
         return WebGPUTexture::MipmapGenerationStrategy::RENDER_PASS;
@@ -217,16 +191,16 @@ WebGPUTexture::WebGPUTexture(const SamplerType samplerType, const uint8_t levels
     : HwTexture{ samplerType, levels, samples, width, height, depth, format, usage, asynchronous },
       mViewFormat{ toWGPUTextureFormat(format) },
       mMipmapGenerationStrategy{ determineMipmapGenerationStrategy(mViewFormat, samplerType,
-              samples, levels) },
+              samples, levels, device.HasFeature(wgpu::FeatureName::Float32Filterable)) },
       mWebGPUFormat{ mMipmapGenerationStrategy == MipmapGenerationStrategy::SPD_COMPUTE_PASS
                              ? storageBindingCompatibleFormatForViewFormat(mViewFormat)
                              : mViewFormat },
       mAspect{ fToWGPUTextureViewAspect(usage, format) },
-      mWebGPUUsage{ fToWGPUTextureUsage(usage, samples,
+      mWebGPUUsage{ fToWGPUTextureUsage(usage, format, samples,
               mMipmapGenerationStrategy == MipmapGenerationStrategy::SPD_COMPUTE_PASS,
               mMipmapGenerationStrategy == MipmapGenerationStrategy::RENDER_PASS,
               supportsTransientAttachment(device)) },
-      mViewUsage{ fToWGPUTextureUsage(usage, samples, false, false,
+      mViewUsage{ fToWGPUTextureUsage(usage, format, samples, false, false,
               supportsTransientAttachment(device)) },
       mDimension{ toWebGPUTextureViewDimension(samplerType) },
       mBlockWidth{ filament::backend::getBlockWidth(format) },
@@ -242,6 +216,32 @@ WebGPUTexture::WebGPUTexture(const SamplerType samplerType, const uint8_t levels
                     "count to either be 1 (no multisampling) or 4, at least as of April 2025 of "
                     "the spec. See https://www.w3.org/TR/webgpu/#texture-creation or "
                     "https://gpuweb.github.io/gpuweb/#multisample-state");
+    if (isCompressedFormat(format)) {
+        FILAMENT_CHECK_PRECONDITION(samples == 1)
+                << "Compressed textures do not support multisampling (" << +samples << " samples).";
+#if !defined(__EMSCRIPTEN__)
+        bool const supportsUnaligned =
+                device.HasFeature(wgpu::FeatureName::TextureCompressionUnaligned);
+#else
+        constexpr bool supportsUnaligned = false;
+#endif
+        FILAMENT_CHECK_PRECONDITION(supportsUnaligned ||
+                (width % mBlockWidth == 0 && height % mBlockHeight == 0))
+                << "Compressed texture dimensions (" << width << "x" << height
+                << ") must be a multiple of the block size (" << mBlockWidth << "x"
+                << mBlockHeight << ") because TextureCompressionUnaligned is not enabled.";
+        if (samplerType == SamplerType::SAMPLER_3D) {
+            bool const supports3D =
+                    ((isS3TCCompression(format) || isRGTCCompression(format) ||
+                             isBPTCCompression(format)) &&
+                            device.HasFeature(wgpu::FeatureName::TextureCompressionBCSliced3D)) ||
+                    (isASTCCompression(format) &&
+                            device.HasFeature(wgpu::FeatureName::TextureCompressionASTCSliced3D));
+            FILAMENT_CHECK_PRECONDITION(supports3D)
+                    << "3D compressed texture format " << static_cast<uint32_t>(format)
+                    << " is not supported by this WebGPU device.";
+        }
+    }
     bool const isTransient = isTransientUsage(mWebGPUUsage);
     const wgpu::TextureDescriptor textureDescriptor{
         .label = getUserTextureLabel(samplerType),

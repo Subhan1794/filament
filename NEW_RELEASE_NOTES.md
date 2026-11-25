@@ -6,10 +6,12 @@
 appropriate header in [RELEASE_NOTES.md](./RELEASE_NOTES.md).
 
 ## Release notes for next branch cut
-- filamat: convert FOG variant into a specialization constant. [⚠️ **Recompile Materials**]
-- engine: in `AsynchronousMode::AMORTIZATION`, queued async operations now run at the end of each
-  frame and in `Renderer::skipFrame()`, within a per-frame time budget set by the new
-  `Engine::Config::asynchronousFrameBudget` (2 ms by default), instead of 5 operations per backend
-  tick. Metal now runs them every frame too
-- java: `Engine.Config.asynchronousFrameBudget` (in nanoseconds) is added
-- web: `Engine$Config.asynchronousFrameBudgetMs` is added
+- filagui: fix `ImGuiHelper` drawing nothing with Dear ImGui 1.92.9, which no longer updates the
+  obsolete `ImDrawData::CmdListsCount` in `ImGui::Render()`
+- resgen, bluegl: generated ELF assembly and the BlueGL Linux trampolines now carry a
+  `.note.GNU-stack` section, so linking Filament's static libraries with GNU ld no longer marks
+  the output as needing an executable stack
+- gltfio: `AssetLoader::destroyAsset()` now destroys each instance root's transform component
+  directly rather than relying on `Engine` garbage collection (#10852)
+- filamentapp: `HeadlessDisplayManager` now waits before retrying a declined frame, so headless
+  runs are no longer dominated by retries of skipped frames

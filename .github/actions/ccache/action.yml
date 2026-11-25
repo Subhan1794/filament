@@ -34,11 +34,9 @@ inputs:
       Every value needs a writer in postsubmit that compiles the same configuration, otherwise
       readers restore an entry that cannot hit:
 
-        - desktop-release: the ccache-arm-linux warmer. Read by build-linux, and by the release
-          half of test-code-correctness. WebGPU is on, because build/linux/build.sh passes -W;
-          both readers have to pass it too, since it reaches every compile line.
-        - desktop-asan-debug: the ccache-arm-linux warmer. Read by the debug half of
-          test-code-correctness.
+        - desktop-release: the ccache-arm-linux warmer. Read by build-linux. WebGPU is on,
+          because build/linux/build.sh passes -W.
+        - desktop-asan-debug: the ccache-arm-linux warmer. Read by test-code-correctness.
         - desktop-backend-test: the ccache-arm-linux warmer. Read by test-backend.
         - desktop-renderdiff: the ccache-arm-linux warmer. Read by test-renderdiff, and by the
           golden generation jobs, which have to compile what presubmit compiles. Debug with WebGPU
@@ -108,9 +106,10 @@ runs:
         #
         # Correct these from `gh cache list` and from the eviction warning ccache-stats prints.
         # Headroom is tight: the repository held 12.6 GB across 64 entries at that date, shared
-        # with the mesa (905 MiB), emsdk (498 MiB per architecture), Vulkan SDK, CodeQL and glTF
-        # asset caches, and GitHub evicts least-recently-used entries. Re-earning an evicted mesa
-        # entry costs 30 to 60 minutes of paid runner time.
+        # with the mesa (905 MiB when it held the whole checkout; it now holds only the mesa/out
+        # install prefix, so re-measure it), emsdk (498 MiB per architecture), Vulkan SDK, CodeQL
+        # and glTF asset caches, and GitHub evicts least-recently-used entries. Re-earning an
+        # evicted mesa entry costs 30 to 60 minutes of paid runner time.
         case "${{ inputs.config }}" in
           ios)     CONFIG_BUDGET_MIB=2048 ;;
           desktop) CONFIG_BUDGET_MIB=2048 ;;

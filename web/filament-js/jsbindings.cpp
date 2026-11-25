@@ -513,6 +513,8 @@ class_<Engine>("Engine")
 
     .function("unprotected", &Engine::unprotected)
 
+    .function("gc", &Engine::gc)
+
     .function("enableAccurateTranslations", &Engine::enableAccurateTranslations)
 
     .function("setAutomaticInstancingEnabled", &Engine::setAutomaticInstancingEnabled)
@@ -913,6 +915,8 @@ class_<View>("View")
     .function("_setScreenSpaceReflectionsOptions", &View::setScreenSpaceReflectionsOptions)
     .function("_setBloomOptions", &View::setBloomOptions)
     .function("setShadowingEnabled", &View::setShadowingEnabled)
+    .function("setTighterShadowCasterCullingEnabled", &View::setTighterShadowCasterCullingEnabled)
+    .function("isTighterShadowCasterCullingEnabled", &View::isTighterShadowCasterCullingEnabled)
     .function("isShadowingEnabled", &View::isShadowingEnabled)
     .function("setShadowType", &View::setShadowType)
     .function("getShadowType", &View::getShadowType)
@@ -931,6 +935,7 @@ class_<View>("View")
     .function("_setFogOptions", &View::setFogOptions)
     .function("_setVignetteOptions", &View::setVignetteOptions)
     .function("_setGuardBandOptions", &View::setGuardBandOptions)
+    .function("_setMotionVectorsOptions", &View::setMotionVectorsOptions)
     .function("_setStereoscopicOptions", &View::setStereoscopicOptions)
     .function("setAmbientOcclusion", &View::setAmbientOcclusion)
     .function("getAmbientOcclusion", &View::getAmbientOcclusion)
@@ -2561,7 +2566,7 @@ class_<AssetLoader>("gltfio$AssetLoader")
     .function("_createInstancedAsset", EMBIND_LAMBDA(FilamentAsset*,
             (AssetLoader* self, BufferDescriptor buffer, int numInstances), {
         // Ignore the returned instances, they can be extracted from the asset.
-        std::vector<FilamentInstance*> instances;
+        std::vector<FilamentInstance*> instances(numInstances);
         return self->createInstancedAsset((const uint8_t*) buffer.bd->buffer,
                 buffer.bd->size, instances.data(), numInstances);
     }), allow_raw_pointers())
@@ -2575,7 +2580,7 @@ class_<AssetLoader>("gltfio$AssetLoader")
     // components, material instances, vertex buffers, index buffers, and textures.
     // asset ::argument:: the Filament asset created using AssetLoader
     .function("destroyAsset", &AssetLoader::destroyAsset, allow_raw_pointers())
-    
+
     // gc ::method::
     // Performs a Garbage Collection sweep over all internal component managers.
     .function("gc", &AssetLoader::gc, allow_raw_pointers());
@@ -2694,6 +2699,7 @@ value_object<ViewSettings>("ViewSettings")
     .field("vignette", &ViewSettings::vignette)
     .field("vsmShadowOptions", &ViewSettings::vsmShadowOptions)
     .field("guardBand", &ViewSettings::guardBand)
+    .field("motionVectors", &ViewSettings::motionVectors)
     .field("stereoscopicOptions", &ViewSettings::stereoscopicOptions)
     .field("colorGrading", &ViewSettings::colorGrading)
     .field("dynamicLighting", &ViewSettings::dynamicLighting)

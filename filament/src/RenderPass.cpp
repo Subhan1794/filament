@@ -47,6 +47,7 @@
 #include <utils/debug.h>
 #include <utils/JobSystem.h>
 #include <utils/Logger.h>
+#include <utils/memalign.h>
 #include <utils/Panic.h>
 #include <utils/Range.h>
 #include <utils/Slice.h>
@@ -300,9 +301,9 @@ RenderPass::Command* RenderPass::instanceify(
     // hash of those parameters.
 
     UTILS_UNUSED uint32_t drawCallsSavedCount = 0;
-    PerRenderableData const* uboData = nullptr;
     uint32_t instancedPrimitiveOffset = 0;
     size_t const count = std::distance(curr, last);
+    std::vector<uint32_t> instancedIndices;
 
     auto equivalent = [](Command const& lhs, Command const& rhs) {
         // This predicate must also filter out commands that are not eligible for auto-instancing.
@@ -331,25 +332,21 @@ RenderPass::Command* RenderPass::instanceify(
                lhs.info.rasterState == rhs.info.rasterState;
     };
 
-    auto processor = [this, eyeCount, count,
-            &uboData, &instancedPrimitiveOffset, &drawCallsSavedCount,
-            &stagingBuffer = mInstancingStagingBuffer,
+    auto processor = [eyeCount, count,
+            &instancedPrimitiveOffset, &drawCallsSavedCount, &instancedIndices,
             &descriptorSetPatch = mInstancingDescriptorSetPatch]
             (Command* const dst, Command* const begin, Command* const end) mutable {
 
         uint32_t const instanceCount = std::distance(begin, end);
         drawCallsSavedCount += instanceCount - 1;
 
-        if (UTILS_UNLIKELY(stagingBuffer.empty())) {
-            stagingBuffer.resize(count);
-            descriptorSetPatch.reserve(count);
-            uboData = mRenderableSoa.data<FScene::UBO>();
-            assert_invariant(uboData);
+        if (UTILS_UNLIKELY(instancedIndices.empty())) {
+            instancedIndices.reserve(std::min<size_t>(count, CONFIG_MAX_INSTANCES));
+            descriptorSetPatch.reserve(std::min<size_t>(count / 2, 32));
         }
 
-        assert_invariant(instancedPrimitiveOffset + instanceCount <= stagingBuffer.size());
         for (uint32_t i = 0; i < instanceCount; i++) {
-            stagingBuffer[instancedPrimitiveOffset + i] = uboData[begin[i].info.index];
+            instancedIndices.push_back(begin[i].info.index);
         }
 
         // Modify the command at its final destination
@@ -362,7 +359,29 @@ RenderPass::Command* RenderPass::instanceify(
     };
 
     auto const end = compact<CONFIG_MAX_INSTANCES>(curr, last, equivalent, processor);
-    // if (!mInstancingStagingBuffer.empty()) {
+
+    assert_invariant(instancedPrimitiveOffset == instancedIndices.size());
+    if (UTILS_UNLIKELY(!instancedIndices.empty())) {
+        PerRenderableData const* const uboData = mRenderableSoa.data<FScene::UBO>();
+        assert_invariant(uboData);
+
+        size_t const uploadSize = sizeof(PerRenderableData) * instancedIndices.size();
+        PerRenderableData* const stagingData = static_cast<PerRenderableData*>(
+                utils::aligned_alloc(uploadSize, alignof(PerRenderableData)));
+        assert_invariant(stagingData);
+
+        for (size_t i = 0, n = instancedIndices.size(); i < n; i++) {
+            stagingData[i] = uboData[instancedIndices[i]];
+        }
+
+        assert_invariant(mInstancingStagingBuffer.buffer == nullptr);
+        mInstancingStagingBuffer = BufferDescriptor{
+            stagingData, uploadSize,
+            [](void* const b, size_t, void*) { utils::aligned_free(b); }
+        };
+    }
+
+    // if (mInstancingStagingBuffer.buffer != nullptr) {
     //     slog.d << "auto-instancing, saving " << drawCallsSavedCount << " draw calls, out of "
     //             << count << io::endl;
     // }
@@ -371,10 +390,23 @@ RenderPass::Command* RenderPass::instanceify(
 
 
 void RenderPass::finalize(FEngine const& engine, DriverApi& driver) {
+    static_assert(sizeof(PerRenderableUib) == CONFIG_MAX_INSTANCES * sizeof(PerRenderableData),
+            "PerRenderableUib size must match CONFIG_MAX_INSTANCES * sizeof(PerRenderableData)");
+
     mFinalized = true;
-    if (UTILS_UNLIKELY(!mInstancingStagingBuffer.empty())) {
-        auto const* p = mInstancingStagingBuffer.data();
-        size_t const size = sizeof(PerRenderableData) * mInstancingStagingBuffer.size();
+    if (UTILS_UNLIKELY(mInstancingStagingBuffer.buffer != nullptr)) {
+        assert_invariant(!mInstancingDescriptorSetPatch.empty());
+
+        // Every patched instanced command binds mInstancedDescriptorSetHandle with a dynamic
+        // offset of `curr->info.index * sizeof(PerRenderableData)` and a bound range of
+        // `sizeof(PerRenderableUib)`. Since mInstancingDescriptorSetPatch is ordered by
+        // increasing `info.index`, `maxDynamicOffset + sizeof(PerRenderableUib)` is the exact
+        // minimum UBO size that keeps every dynamic bind in-bounds across all backends.
+        size_t const maxDynamicOffset =
+                size_t(mInstancingDescriptorSetPatch.back()->info.index) *
+                sizeof(PerRenderableData);
+        size_t const uboSize = maxDynamicOffset + sizeof(PerRenderableUib);
+        assert_invariant(mInstancingStagingBuffer.size <= uboSize);
 
         // Create a temporary UBO for holding the per-renderable data of each primitive,
         // The `curr->info.index` is updated so that this (now instanced) command can
@@ -384,7 +416,7 @@ void RenderPass::finalize(FEngine const& engine, DriverApi& driver) {
 
         // create a temporary UBO for instancing
         mInstancedUboHandle = BufferObjectSharedHandle{
-            driver.createBufferObject(size + sizeof(PerRenderableUib),
+            driver.createBufferObject(uboSize,
                     BufferObjectBinding::UNIFORM, BufferUsage::STATIC), driver };
 
         // We also need a descriptor-set to hold the custom UBO. This works because
@@ -401,9 +433,8 @@ void RenderPass::finalize(FEngine const& engine, DriverApi& driver) {
                 +PerRenderableBindingPoints::OBJECT_UNIFORMS,
                 mInstancedUboHandle, 0, sizeof(PerRenderableUib));
 
-        driver.updateBufferObjectUnsynchronized(mInstancedUboHandle,
-            BufferDescriptor::make(p, size,
-                [data = std::move(mInstancingStagingBuffer)](void*, size_t) {}), 0);
+        driver.updateBufferObjectUnsynchronized(
+                mInstancedUboHandle, std::move(mInstancingStagingBuffer), 0);
 
         // patch the commands with the descriptor set
         for (Command* const curr : mInstancingDescriptorSetPatch) {
@@ -411,8 +442,11 @@ void RenderPass::finalize(FEngine const& engine, DriverApi& driver) {
             assert_invariant(!curr[0].info.dsh);
             curr[0].info.dsh = mInstancedDescriptorSetHandle;
         }
-        mInstancingDescriptorSetPatch.clear();
-        assert_invariant(mInstancingStagingBuffer.empty());
+        // The patch list is no longer needed, but this RenderPass outlives the frame's
+        // FrameGraph execution. Swap with a temporary to release the heap storage now;
+        // clear() or `= {}` (initializer_list assignment) would both retain the capacity.
+        std::vector<Command*>{}.swap(mInstancingDescriptorSetPatch);
+        assert_invariant(mInstancingStagingBuffer.buffer == nullptr);
     }
 }
 
@@ -421,12 +455,13 @@ UTILS_ALWAYS_INLINE // This function exists only to make the code more readable.
 inline              // and we don't need it in the compilation unit
 void RenderPass::setupColorCommand(Command& cmdDraw, Variant variant, DynamicSpecConstKey const specKey,
         FMaterialInstance const* const UTILS_RESTRICT mi,
-        bool const inverseFrontFaces, bool const hasDepthClamp) noexcept {
+        bool const inverseFrontFaces, bool const hasDepthClamp,
+        bool const hasFogAsPostProcess) noexcept {
 
     FMaterial const * const UTILS_RESTRICT ma = mi->getMaterial();
     variant = Variant::filterVariant(variant, ma->isVariantLit());
 
-    DynamicSpecConstKey const dynamicSpecConstKey =
+    DynamicSpecConstKey dynamicSpecConstKey =
             ma->getDefinition().filterProgramSpecKey(variant, specKey);
 
     // Below, we evaluate both commands to avoid a branch
@@ -440,6 +475,13 @@ void RenderPass::setupColorCommand(Command& cmdDraw, Variant variant, DynamicSpe
     bool const hasScreenSpaceRefraction = ma->getRefractionMode() == RefractionMode::SCREEN_SPACE;
     bool const isBlendingCommand = !hasScreenSpaceRefraction &&
             (blendingMode != BlendingMode::OPAQUE && blendingMode != BlendingMode::MASKED);
+
+    // When fog is applied as a post-process, non-blended commands must be drawn without fog.
+    // This must happen before computing the sort key below so that it matches the program
+    // actually used (see LocalProgramCache::filterForGetProgram()).
+    if (UTILS_UNLIKELY(hasFogAsPostProcess && !isBlendingCommand)) {
+        dynamicSpecConstKey.setFog(false);
+    }
 
     RasterState rasterState = mi->getRasterState();
 
@@ -557,8 +599,22 @@ RenderPass::Command* RenderPass::generateCommandsImpl(CommandTypeFlags extraFlag
     bool const filterTranslucentObjects =
             bool(extraFlags & CommandTypeFlags::FILTER_TRANSLUCENT_OBJECTS);
 
+    bool const isMotionVectorsPass =
+            bool(extraFlags & CommandTypeFlags::MOTION_VECTORS);
+
+    bool const motionVectorsReuseDepth =
+            bool(extraFlags & CommandTypeFlags::MOTION_VECTORS_REUSE_DEPTH);
+
+    bool const motionVectorsChannelDepthClear =
+            bool(extraFlags & CommandTypeFlags::MOTION_VECTORS_CHANNEL_DEPTH_CLEAR);
+
     bool const hasShadowing =
             renderFlags & HAS_SHADOWING;
+
+    // The motion vectors pass must match the color pass's coverage, so it always uses the regular
+    // culling mode.
+    bool const useShadowCulling =
+            hasShadowing && !isMotionVectorsPass;
 
     bool const viewInverseFrontFaces =
             renderFlags & HAS_INVERSE_FRONT_FACES;
@@ -568,6 +624,12 @@ RenderPass::Command* RenderPass::generateCommandsImpl(CommandTypeFlags extraFlag
 
     bool const hasDepthClamp =
             renderFlags & HAS_DEPTH_CLAMP;
+
+    bool const hasFogAsPostProcess =
+            renderFlags & HAS_FOG_AS_POSTPROCESS;
+
+    bool const isPickingVariant = Variant::isPickingVariant(variant);
+    bool const depthColorWrite = isPickingVariant || Variant::isDepthMomentsVariant(variant);
 
     float const cameraPositionDotCameraForward = dot(cameraPosition, cameraForward);
 
@@ -588,8 +650,8 @@ RenderPass::Command* RenderPass::generateCommandsImpl(CommandTypeFlags extraFlag
         cmd.info.dynamicSpecConstKey = DynamicSpecConstKey::filterProgramSpecKey(
                 variant, specKey, MaterialDomain::SURFACE, true);
         cmd.info.rasterState = {};
-        cmd.info.rasterState.colorWrite = Variant::isPickingVariant(variant) || Variant::isDepthMomentsVariant(variant);
-        cmd.info.rasterState.depthWrite = true;
+        cmd.info.rasterState.colorWrite = depthColorWrite;
+        cmd.info.rasterState.depthWrite = !motionVectorsReuseDepth;
         cmd.info.rasterState.depthFunc = RasterState::DepthFunc::GE;
         cmd.info.rasterState.alphaToCoverage = false;
         cmd.info.rasterState.depthClamp = hasDepthClamp;
@@ -598,6 +660,9 @@ RenderPass::Command* RenderPass::generateCommandsImpl(CommandTypeFlags extraFlag
     for (uint32_t i = range.first; i < range.last; ++i) {
         // Check if this renderable passes the visibilityMask.
         if (UTILS_UNLIKELY(!(soaVisibilityMask[i] & visibilityMask))) {
+            continue;
+        }
+        if (motionVectorsReuseDepth && UTILS_LIKELY(!soaVisibility[i].motionMoved)) {
             continue;
         }
 
@@ -682,6 +747,7 @@ RenderPass::Command* RenderPass::generateCommandsImpl(CommandTypeFlags extraFlag
 
         const bool shadowCaster = soaVisibility[i].castShadows & hasShadowing;
         const bool writeDepthForShadowCasters = depthContainsShadowCasters & shadowCaster;
+        const bool renderableMoved = isMotionVectorsPass & soaVisibility[i].motionMoved;
 
         Slice<const FRenderPrimitive> const primitives = soaPrimitives[i];
         /*
@@ -721,7 +787,7 @@ RenderPass::Command* RenderPass::generateCommandsImpl(CommandTypeFlags extraFlag
 
             if constexpr (isColorPass) {
                 setupColorCommand(cmd, renderableVariant, renderableSpecKey, mi,
-                        inverseFrontFaces, hasDepthClamp);
+                        inverseFrontFaces, hasDepthClamp, hasFogAsPostProcess);
                 const bool blendPass = Pass(cmd.key & PASS_MASK) == Pass::BLENDED;
                 if (blendPass) {
                     // TODO: at least for transparent objects, AABB should be per primitive
@@ -803,31 +869,65 @@ RenderPass::Command* RenderPass::generateCommandsImpl(CommandTypeFlags extraFlag
                 curr->key |= select(mi->getCullingMode() == CullingMode::FRONT_AND_BACK);
 
             } else if constexpr (isDepthPass) {
-                const CullingMode cullingMode = hasShadowing ? mi->getShadowCullingMode() : mi->getCullingMode();
+                const CullingMode cullingMode = useShadowCulling ?
+                        mi->getShadowCullingMode() : mi->getCullingMode();
                 const RasterState rs = ma->getRasterState();
                 const TransparencyMode mode = mi->getTransparencyMode();
                 const BlendingMode blendingMode = ma->getBlendingMode();
                 const bool translucent = (blendingMode != BlendingMode::OPAQUE
                         && blendingMode != BlendingMode::MASKED);
-                const bool isPickingVariant = Variant::isPickingVariant(variant);
-
-                cmd.key |= mi->getSortingKey(); // already all set-up for direct or'ing
-                cmd.info.rasterState.culling = cullingMode;
 
                 // FIXME: should writeDepthForShadowCasters take precedence over mi->getDepthWrite()?
-                cmd.info.rasterState.depthWrite =
+                bool const depthWrite =
                         (1 // only keep bit 0
                                 & (mi->isDepthWriteEnabled() |
                                           (mode == TransparencyMode::TWO_PASSES_ONE_SIDE) |
                                           isPickingVariant) &
                                 !(depthFilterAlphaMaskedObjects & rs.alphaToCoverage)) |
                         writeDepthForShadowCasters;
+                cmd.info.rasterState.depthWrite = depthWrite & !motionVectorsReuseDepth;
+
+                // In the motion vectors pass, primitives of renderables that moved write their
+                // motion vectors with the MOT variant; when the pass has its own depth buffer, all
+                // others only write depth, as occluders (including materials without a MOT
+                // variant). When a channel clears the depth buffer mid-pass, static renderables
+                // with a MOT variant also write their (zero) motion vectors to overwrite any
+                // previous channel's motion vectors. Note that the dynamic specialization constants
+                // key, computed above for the DEPTH variant, is the same with MOT.
+                bool const mot = isMotionVectorsPass &&
+                        ((renderableMoved | motionVectorsChannelDepthClear) &
+                         ma->hasMotionVectorsVariant());
+                // MOT is (MNT | PCK), and PCK is the picking bit: setting the MOT bits to false
+                // outside of the motion vectors pass would also clear the picking bit (and the
+                // VSM one), silently turning a picking command into a plain depth command that
+                // writes no color, so the picking buffer would never be filled.
+                if (isMotionVectorsPass) {
+                    cmd.info.materialVariant.setMotionVectors(mot);
+                }
+                cmd.info.rasterState.colorWrite = depthColorWrite | mot;
+                cmd.info.rasterState.culling = cullingMode;
+
+                cmd.key &= ~MATERIAL_MASK;
+                cmd.key |= mi->getSortingKey(); // already all set-up for direct or'ing
+                cmd.key |= makeField(cmd.info.materialVariant.key,
+                        MATERIAL_VARIANT_KEY_MASK, MATERIAL_VARIANT_KEY_SHIFT);
 
                 *curr = cmd;
-                // cancel command if both front and back faces are culled
-                curr->key |= select(cullingMode == CullingMode::FRONT_AND_BACK);
-                // cancel command if asked to filter translucent objects
-                curr->key |= select(filterTranslucentObjects & translucent);
+                // cancel command if both front and back faces are culled, if asked to filter
+                // translucent objects, or (in the motion vectors pass) if it doesn't write depth in
+                // the color pass or (when reusing depth) has no motion vectors variant
+                curr->key |= select((cullingMode == CullingMode::FRONT_AND_BACK) |
+                        (filterTranslucentObjects & translucent) |
+                        (isMotionVectorsPass & !depthWrite) |
+                        (motionVectorsReuseDepth & !mot));
+                // in the motion vectors pass, when static occluders are drawn, draw moving
+                // primitives after all static ones, across channels unless a channel clears the
+                // depth buffer (see the key layout). This is applied to curr->key because cmd.key
+                // accumulates bits across the primitives of a renderable.
+                curr->key |= select(!motionVectorsReuseDepth & renderableMoved &
+                        ma->hasMotionVectorsVariant(),
+                        (motionVectorsChannelDepthClear ? CommandKey(0) : CHANNEL_MASK) |
+                        BLENDING_MASK);
             }
 
             ++curr;
@@ -1019,7 +1119,12 @@ void RenderPass::Executor::execute(FEngine const& engine, DriverApi& driver,
                     assert_invariant(index < mCustomCommands.size());
                     pCustomCommands[index]();
                     currentPipeline = {};
-                    currentPrimitiveHandle ={};
+                    currentPrimitiveHandle = {};
+                    currentScissor = {};
+                    if (UTILS_UNLIKELY(hasScissorOverride)) {
+                        currentScissor = mScissor;
+                        driver.scissor(mScissor);
+                    }
                     continue;
                 }
 
@@ -1132,7 +1237,10 @@ void RenderPass::Executor::execute(FEngine const& engine, DriverApi& driver,
                         +DescriptorSetBindingPoints::PER_RENDERABLE,
                         {{ offset, info.skinningOffset }, driver});
 
-                if (UTILS_UNLIKELY(info.hasMorphing)) {
+                // Both skinning and morphing share Variant::SKINNING_OR_MORPHING, whose vertex shader
+                // declares pushConstants.morphingBufferOffset; WebGPU requires immediate data to
+                // be populated whenever the bound shader variant references it.
+                if (UTILS_UNLIKELY(info.materialVariant.hasSkinningOrMorphing())) {
                     driver.setPushConstant(ShaderStage::VERTEX,
                             +PushConstantIds::MORPHING_BUFFER_OFFSET, int32_t(info.morphingOffset));
                 }

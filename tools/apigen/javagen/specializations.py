@@ -757,7 +757,10 @@ ENGINE_METHODS_JAVA = """    private Engine(long nativeEngine, @Nullable Config 
 
 
     public void destroySwapChain(@NonNull SwapChain swapChain) {
-        assertDestroy(nDestroySwapChain(getNativeObject(), swapChain.getNativeObject()));
+        // Only SwapChains from createSwapChain(Object) hold a native window reference.
+        boolean releaseNativeWindow = Platform.get().validateSurface(swapChain.getNativeWindow());
+        assertDestroy(nDestroySwapChain(getNativeObject(), swapChain.getNativeObject(),
+                releaseNativeWindow));
         swapChain.clearNativeObject();
     }
 
@@ -910,7 +913,7 @@ ENGINE_NATIVE_DECLS_JAVA: List[str] = [
     "    private static native boolean nDestroySkinningBuffer(long nativeEngine, long nativeSkinningBuffer);",
     "    private static native boolean nDestroySkybox(long nativeEngine, long nativeSkybox);",
     "    private static native boolean nDestroyStream(long nativeEngine, long nativeStream);",
-    "    private static native boolean nDestroySwapChain(long nativeEngine, long nativeSwapChain);",
+    "    private static native boolean nDestroySwapChain(long nativeEngine, long nativeSwapChain, boolean releaseNativeWindow);",
     "    private static native boolean nDestroyTexture(long nativeEngine, long nativeTexture);",
     "    private static native boolean nDestroyVertexBuffer(long nativeEngine, long nativeVertexBuffer);",
     "    private static native boolean nDestroyView(long nativeEngine, long nativeView);",
@@ -1106,13 +1109,14 @@ def get_engine_jni_methods(jni_package: str) -> str:
     Returns:
         Formatted C++ source block containing all specialized `Engine` JNI functions.
     """
-    # Generate typed Engine::destroy(T*) bridges for all 20 Engine-managed resource types.
+    # Generate typed Engine::destroy(T*) bridges for Engine-managed resource types.
+    # SwapChain is handwritten below because it also releases the native window.
     types = [
         "BufferObject", "ColorGrading", "Fence", "FramePacer",
         "IndexBuffer", "IndirectLight", "InstanceBuffer", "Material",
         "MaterialInstance", "MorphTargetBuffer", "RenderTarget",
         "Renderer", "Scene", "SkinningBuffer", "Skybox", "Stream",
-        "SwapChain", "Texture", "VertexBuffer", "View",
+        "Texture", "VertexBuffer", "View",
     ]
     destroy_funcs = [
         f"""extern "C" JNIEXPORT jboolean JNICALL
@@ -1138,6 +1142,7 @@ Java_{jni_package}_Engine_nDestroyEngine(JNIEnv *env, jclass, jlong nativeEngine
 
 extern "C" {{
 extern void* getNativeWindow(JNIEnv* env, jclass, jobject surface);
+extern void releaseNativeWindow(void* nativeWindow);
 }}
 
 extern "C" JNIEXPORT jlong JNICALL
@@ -1162,6 +1167,27 @@ Java_{jni_package}_Engine_nCreateSwapChainFromRawPointer(JNIEnv*,
     return (jlong) engine->createSwapChain((void*) pointer, (uint64_t) flags);
 }}
 
+extern "C" JNIEXPORT jboolean JNICALL
+Java_{jni_package}_Engine_nDestroySwapChain(JNIEnv *env, jclass,
+        jlong nativeEngine, jlong nativeObject, jboolean releaseWindow) {{
+    Engine* engine = (Engine*) nativeEngine;
+    SwapChain* obj = (SwapChain*) nativeObject;
+    return wrapJni<jboolean>(env, [=]() {{
+        // nCreateSwapChain holds a window reference until here. Queued driver commands may still
+        // use the window, so wait for them before releasing it. A paused engine never drains its
+        // queue, so the reference is kept in that case.
+        void* const nativeWindow =
+                (releaseWindow && engine->isValid(obj)) ? obj->getNativeWindow() : nullptr;
+        bool const success = engine->destroy(obj);
+        if (success && nativeWindow && !engine->isPaused()) {{
+            if (Fence::waitAndDestroy(engine->createFence()) ==
+                    Fence::FenceStatus::CONDITION_SATISFIED) {{
+                releaseNativeWindow(nativeWindow);
+            }}
+        }}
+        return success;
+    }});
+}}
 
 extern "C" JNIEXPORT void JNICALL
 Java_{jni_package}_Engine_nDestroyEntity(JNIEnv*, jclass,
@@ -1277,4 +1303,272 @@ Java_{jni_package}_Engine_nBuilderBuild(JNIEnv *env, jclass, jlong nativeBuilder
         return (jlong) builder->build();
     }});
 }}"""
+
+
+# -----------------------------------------------------------------------------
+# MaterialBuilder Specializations
+# -----------------------------------------------------------------------------
+
+MATERIAL_BUILDER_PREAMBLE_JAVA: List[str] = [
+    "    static {",
+    '        System.loadLibrary("filamat-jni");',
+    "",
+    "        Class<?> engineClass = null;",
+    "        java.lang.reflect.Method getJobSystemMethod = null;",
+    "        try {",
+    '            engineClass = Class.forName("com.google.android.filament.Engine");',
+    "            Class<?> helperClass = Class.forName(",
+    '                    "com.google.android.filament.FilamentHelper");',
+    "            getJobSystemMethod = helperClass.getDeclaredMethod(",
+    '                    "getJobSystem", engineClass);',
+    "            getJobSystemMethod.setAccessible(true);",
+    "        } catch (Exception e) {",
+    "            // Ignore if we can't find these symbols.",
+    "        }",
+    "        sEngineClass = engineClass;",
+    "        sGetJobSystemMethod = getJobSystemMethod;",
+    "    }",
+    "",
+    "    @Nullable private static final Class<?> sEngineClass;",
+    "    @Nullable private static final java.lang.reflect.Method sGetJobSystemMethod;",
+    "",
+    "    @SuppressWarnings({\"FieldCanBeLocal\", \"UnusedDeclaration\"})",
+    "    private final BuilderFinalizer mFinalizer;",
+]
+
+MATERIAL_BUILDER_CTOR_JAVA: List[str] = [
+    "    /**",
+    "     * Creates a new {@link MaterialBuilder} ready to start describing a new material.",
+    "     * Make sure {@link #init} matches has been invoked prior to creating any",
+    "     * {@link MaterialBuilder} or calling any method on a {@link MaterialBuilder} instance.",
+    "     */",
+    "    public MaterialBuilder() {",
+    "        mNativeObject = nCreateMaterialBuilder();",
+    "        mFinalizer = new BuilderFinalizer(mNativeObject);",
+    "    }",
+    "",
+]
+
+MATERIAL_BUILDER_METHODS_JAVA: List[str] = [
+    "    /**",
+    "     * Declare a new uniform parameter with type and name.",
+    "     */",
+    "    @NonNull",
+    "    public MaterialBuilder parameter(@NonNull UniformType type, @NonNull String name) {",
+    "        return parameter(name, type, ParameterPrecision.DEFAULT);",
+    "    }",
+    "",
+    "    /**",
+    "     * Declare a new uniform parameter with type, precision and name.",
+    "     */",
+    "    @NonNull",
+    "    public MaterialBuilder parameter(@NonNull UniformType type,",
+    "            @NonNull ParameterPrecision precision, @NonNull String name) {",
+    "        return parameter(name, type, precision);",
+    "    }",
+    "",
+    "    /**",
+    "     * Declare a new uniform parameter array of the specified size, with type and name.",
+    "     */",
+    "    @NonNull",
+    "    public MaterialBuilder parameter(@NonNull UniformType type, @IntRange(from = 0) int size,",
+    "            @NonNull String name) {",
+    "        return parameter(name, size, type, ParameterPrecision.DEFAULT);",
+    "    }",
+    "",
+    "    /**",
+    "     * Declare a new uniform parameter array of the specified size, with type, precision and name.",
+    "     */",
+    "    @NonNull",
+    "    public MaterialBuilder parameter(@NonNull UniformType type, @IntRange(from = 0) int size,",
+    "            @NonNull ParameterPrecision precision, @NonNull String name) {",
+    "        return parameter(name, size, type, precision);",
+    "    }",
+    "",
+    "    /**",
+    "     * Declare a new sampler parameter with the specified type, format, precision and name.",
+    "     */",
+    "    @NonNull",
+    "    public MaterialBuilder parameter(@NonNull SamplerType type, @NonNull SamplerFormat format,",
+    "            @NonNull ParameterPrecision precision, @NonNull String name) {",
+    "        return parameter(name, type, format, precision);",
+    "    }",
+    "",
+    "    /**",
+    "     * Declare a new uniform parameter with type and name.",
+    "     */",
+    "    @NonNull",
+    "    public MaterialBuilder uniformParameter(@NonNull UniformType type, @NonNull String name) {",
+    "        return parameter(name, type, ParameterPrecision.DEFAULT);",
+    "    }",
+    "",
+    "    /**",
+    "     * Declare a new uniform parameter with type, precision and name.",
+    "     */",
+    "    @NonNull",
+    "    public MaterialBuilder uniformParameter(@NonNull UniformType type,",
+    "            @NonNull ParameterPrecision precision, @NonNull String name) {",
+    "        return parameter(name, type, precision);",
+    "    }",
+    "",
+    "    /**",
+    "     * Declare a new uniform parameter array of the specified size, with type and name.",
+    "     */",
+    "    @NonNull",
+    "    public MaterialBuilder uniformParameterArray(@NonNull UniformType type, @IntRange(from = 0) int size,",
+    "            @NonNull String name) {",
+    "        return parameter(name, size, type, ParameterPrecision.DEFAULT);",
+    "    }",
+    "",
+    "    /**",
+    "     * Declare a new uniform parameter array of the specified size, with type, precision and name.",
+    "     */",
+    "    @NonNull",
+    "    public MaterialBuilder uniformParameterArray(@NonNull UniformType type, @IntRange(from = 0) int size,",
+    "            @NonNull ParameterPrecision precision, @NonNull String name) {",
+    "        return parameter(name, size, type, precision);",
+    "    }",
+    "",
+    "    /**",
+    "     * Declare a new sampler parameter with the specified type, format, precision and name.",
+    "     */",
+    "    @NonNull",
+    "    public MaterialBuilder samplerParameter(@NonNull SamplerType type, @NonNull SamplerFormat format,",
+    "            @NonNull ParameterPrecision precision, @NonNull String name) {",
+    "        return parameter(name, type, format, precision);",
+    "    }",
+    "",
+    "    /**",
+    "     * Once a material has been described accurately to a MaterialBuilder, invoking this method",
+    "     * will compile the material into a binary format that can be used with Filament's runtime.",
+    "     *",
+    "     * @return Notice that build returns a {@link MaterialPackage} by value, it should not be held",
+    "     * in memory longer than necessary.",
+    "     */",
+    "    @NonNull",
+    "    public MaterialPackage build() {",
+    "        return build(null);",
+    "    }",
+    "",
+    "    /**",
+    "     * Compile the material using the provided JobSystem provider (such as an Engine instance).",
+    "     */",
+    "    @NonNull",
+    "    public MaterialPackage build(@Nullable Object jobSystemProvider) {",
+    "        long nativeJobSystem = 0;",
+    "        if (jobSystemProvider != null) {",
+    "            if (sEngineClass == null || sGetJobSystemMethod == null) {",
+    "                throw new IllegalArgumentException(",
+    '                        "JobSystem cannot be obtained from the provided object");',
+    "            }",
+    "            if (!sEngineClass.isInstance(jobSystemProvider)) {",
+    "                throw new IllegalArgumentException(",
+    '                        "Object is not an instance of Engine");',
+    "            }",
+    "            try {",
+    "                nativeJobSystem = (Long) sGetJobSystemMethod.invoke(null, jobSystemProvider);",
+    "            } catch (Exception e) {",
+    '                throw new IllegalArgumentException("Failed to obtain JobSystem", e);',
+    "            }",
+    "        }",
+    "",
+    "        long nativePackage = nBuilderBuild(mNativeObject, nativeJobSystem);",
+    "        java.nio.ByteBuffer buffer = null;",
+    "        boolean isValid = false;",
+    "        if (nativePackage != 0) {",
+    "            byte[] data = nGetPackageBytes(nativePackage);",
+    "            if (data != null) {",
+    "                buffer = java.nio.ByteBuffer.wrap(data);",
+    "            }",
+    "            isValid = nGetPackageIsValid(nativePackage);",
+    "        }",
+    "        nDestroyPackage(nativePackage);",
+    "        return new MaterialPackage(buffer, isValid);",
+    "    }",
+    "",
+    "    private static class BuilderFinalizer {",
+    "        private final long mNativeObject;",
+    "",
+    "        BuilderFinalizer(long nativeObject) {",
+    "            mNativeObject = nativeObject;",
+    "        }",
+    "",
+    "        @Override",
+    "        public void finalize() {",
+    "            try {",
+    "                super.finalize();",
+    "            } catch (Throwable t) { // Ignore",
+    "            } finally {",
+    "                nDestroyMaterialBuilder(mNativeObject);",
+    "            }",
+    "        }",
+    "    }",
+    "",
+]
+
+MATERIAL_BUILDER_NATIVE_DECLS_JAVA: List[str] = [
+    "    private static native long nCreateMaterialBuilder();",
+    "    private static native void nDestroyMaterialBuilder(long nativeBuilder);",
+    "",
+    "    private static native long nBuilderBuild(long nativeBuilder, long nativeJobSystem);",
+    "    private static native byte[] nGetPackageBytes(long nativePackage);",
+    "    private static native boolean nGetPackageIsValid(long nativePackage);",
+    "    private static native void nDestroyPackage(long nativePackage);",
+]
+
+
+def get_material_builder_jni(jni_package: str) -> str:
+    return f"""extern "C" JNIEXPORT jlong JNICALL
+Java_{jni_package}_MaterialBuilder_nCreateMaterialBuilder(JNIEnv*, jclass) {{
+    MaterialBuilder* builder = new MaterialBuilder();
+    return (jlong) builder;
+}}
+
+extern "C" JNIEXPORT void JNICALL
+Java_{jni_package}_MaterialBuilder_nDestroyMaterialBuilder(JNIEnv*, jclass,
+        jlong nativeBuilder) {{
+    MaterialBuilder* builder = (MaterialBuilder*) nativeBuilder;
+    delete builder;
+}}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_{jni_package}_MaterialBuilder_nBuilderBuild(JNIEnv*, jclass,
+        jlong nativeBuilder, jlong nativeJobSystem) {{
+    MaterialBuilder* builder = (MaterialBuilder*) nativeBuilder;
+    utils::JobSystem* js = (utils::JobSystem*) nativeJobSystem;
+    if (js) {{
+        return (jlong) new Package(builder->build(*js));
+    }} else {{
+        utils::JobSystem tempJs;
+        tempJs.adopt();
+        Package* pkg = new Package(builder->build(tempJs));
+        tempJs.emancipate();
+        return (jlong) pkg;
+    }}
+}}
+
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_{jni_package}_MaterialBuilder_nGetPackageBytes(JNIEnv* env, jclass,
+        jlong nativePackage) {{
+    Package* pkg = (Package*) nativePackage;
+    size_t size = ssize_t(pkg->getSize());
+    jbyteArray data = env->NewByteArray(size);
+    env->SetByteArrayRegion(data, 0, size, (jbyte*) pkg->getData());
+    return data;
+}}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_{jni_package}_MaterialBuilder_nGetPackageIsValid(JNIEnv*, jclass,
+        jlong nativePackage) {{
+    Package* package = (Package*) nativePackage;
+    return jboolean(package->isValid());
+}}
+
+extern "C" JNIEXPORT void JNICALL
+Java_{jni_package}_MaterialBuilder_nDestroyPackage(JNIEnv*, jclass,
+        jlong nativePackage) {{
+    Package* package = (Package*) nativePackage;
+    delete package;
+}}"""
+
 

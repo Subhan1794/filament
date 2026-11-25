@@ -1282,5 +1282,75 @@ class TestExtractor(unittest.TestCase):
         self.assertEqual(vsm_fields["elvsm"].get("default_value"), "false")
         self.assertEqual(vsm_fields["blurWidth"].get("default_value"), "0.0f")
 
+    def test_constant_expression_evaluation(self):
+        """Verify that class-level constants with casts, expressions, and external references evaluate to actual values."""
+        code = """
+        typedef unsigned int uint32_t;
+        typedef unsigned long long uint64_t;
+        typedef unsigned long size_t;
+
+        namespace backend {
+            static constexpr size_t INDEX_COUNT_BITS = 26;
+            static constexpr size_t MAX_INDEX_COUNT = (size_t(1) << INDEX_COUNT_BITS) - 1;
+            static constexpr uint64_t FENCE_WAIT_FOR_EVER = uint64_t(-1);
+            static constexpr uint64_t SWAP_CHAIN_CONFIG_SRGB_COLORSPACE = 0x10;
+        }
+
+        class IndexBufferTest {
+        public:
+            static constexpr uint32_t MAX_INDEX_COUNT = uint32_t(backend::MAX_INDEX_COUNT);
+            static constexpr uint64_t FENCE_WAIT_FOR_EVER = backend::FENCE_WAIT_FOR_EVER;
+            static constexpr uint64_t WAIT_FOR_EVER = FENCE_WAIT_FOR_EVER;
+            static constexpr uint64_t CONFIG_SRGB_COLORSPACE = backend::SWAP_CHAIN_CONFIG_SRGB_COLORSPACE;
+            static constexpr float EFFICIENCY_LED = 0.1171f;
+        };
+        """
+        ex = self.parse_source(code)
+        cls = next(c for c in ex.output["classes"] if c["name"] == "IndexBufferTest")
+        constants = {c["name"]: c["value"] for c in cls["constants"]}
+        self.assertEqual(constants["MAX_INDEX_COUNT"], "67108863")
+        self.assertEqual(constants["FENCE_WAIT_FOR_EVER"], "-1")
+        self.assertEqual(constants["WAIT_FOR_EVER"], "FENCE_WAIT_FOR_EVER")
+        self.assertEqual(constants["CONFIG_SRGB_COLORSPACE"], "0x10")
+        self.assertEqual(constants["EFFICIENCY_LED"], "0.1171f")
+
+    def test_enum_constant_noapigen_and_cond_private(self):
+        """Verify that UTILS_NOAPIGEN and Doxygen \\cond PRIVATE skip individual enum constants in both direct enums and aliased enums."""
+        code = """
+        #define UTILS_NOAPIGEN [[clang::annotate("filament:apigen:skip")]]
+        #define UTILS_APIGEN_FLAGS [[clang::annotate("filament:apigen:flags")]]
+        typedef unsigned short uint16_t;
+
+        namespace backend {
+            enum class UTILS_APIGEN_FLAGS TextureUsage : uint16_t {
+                SAMPLEABLE = 0x01,
+                BLIT_SRC = 0x02,
+                //! \\cond PRIVATE
+                INTERNAL_PRIVATE_FLAG UTILS_NOAPIGEN = 0x04,
+                COND_ONLY_INTERNAL = 0x08,
+                //! \\endcond
+                ATTR_ONLY_INTERNAL UTILS_NOAPIGEN = 0x10,
+            };
+        }
+
+        class TextureAliasTest {
+        public:
+            using Usage = backend::TextureUsage;
+            enum class DirectEnum {
+                PUBLIC_A = 0,
+                HIDDEN_ATTR UTILS_NOAPIGEN = 1,
+                //! \\cond PRIVATE
+                HIDDEN_COND = 2,
+                //! \\endcond
+                PUBLIC_B = 3,
+            };
+        };
+        """
+        ex = self.parse_source(code)
+        cls = next(c for c in ex.output["classes"] if c["name"] == "TextureAliasTest")
+        enums = {e["name"]: [v["name"] for v in e["entries"]] for e in cls["enums"]}
+        self.assertEqual(enums["Usage"], ["SAMPLEABLE", "BLIT_SRC"])
+        self.assertEqual(enums["DirectEnum"], ["PUBLIC_A", "PUBLIC_B"])
+
 if __name__ == '__main__':
     unittest.main()

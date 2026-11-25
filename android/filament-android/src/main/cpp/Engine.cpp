@@ -318,6 +318,14 @@ Java_com_google_android_filament_Engine_nFlush(JNIEnv *env, jclass clazz, jlong 
     });
 }
 
+extern "C" JNIEXPORT void JNICALL
+Java_com_google_android_filament_Engine_nGc(JNIEnv *env, jclass clazz, jlong nativeEngine) {
+    Engine* const that = (Engine*) nativeEngine;
+    wrapJni(env, [=]() {
+        that->gc();
+    });
+}
+
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_google_android_filament_Engine_nIsPaused(JNIEnv *env, jclass clazz, jlong nativeEngine) {
     Engine const * const that = (Engine const *) nativeEngine;
@@ -395,6 +403,7 @@ Java_com_google_android_filament_Engine_nDestroyEngine(JNIEnv *env, jclass, jlon
 
 extern "C" {
 extern void* getNativeWindow(JNIEnv* env, jclass, jobject surface);
+extern void releaseNativeWindow(void* nativeWindow);
 }
 
 extern "C" JNIEXPORT jlong JNICALL
@@ -419,6 +428,27 @@ Java_com_google_android_filament_Engine_nCreateSwapChainFromRawPointer(JNIEnv*,
     return (jlong) engine->createSwapChain((void*) pointer, (uint64_t) flags);
 }
 
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_google_android_filament_Engine_nDestroySwapChain(JNIEnv *env, jclass,
+        jlong nativeEngine, jlong nativeObject, jboolean releaseWindow) {
+    Engine* engine = (Engine*) nativeEngine;
+    SwapChain* obj = (SwapChain*) nativeObject;
+    return wrapJni<jboolean>(env, [=]() {
+        // nCreateSwapChain holds a window reference until here. Queued driver commands may still
+        // use the window, so wait for them before releasing it. A paused engine never drains its
+        // queue, so the reference is kept in that case.
+        void* const nativeWindow =
+                (releaseWindow && engine->isValid(obj)) ? obj->getNativeWindow() : nullptr;
+        bool const success = engine->destroy(obj);
+        if (success && nativeWindow && !engine->isPaused()) {
+            if (Fence::waitAndDestroy(engine->createFence()) ==
+                    Fence::FenceStatus::CONDITION_SATISFIED) {
+                releaseNativeWindow(nativeWindow);
+            }
+        }
+        return success;
+    });
+}
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_google_android_filament_Engine_nDestroyEntity(JNIEnv*, jclass,
@@ -583,16 +613,6 @@ Java_com_google_android_filament_Engine_nDestroyStream(JNIEnv *env, jclass,
         jlong nativeEngine, jlong nativeObject) {
     Engine* engine = (Engine*) nativeEngine;
     Stream* obj = (Stream*) nativeObject;
-    return wrapJni<jboolean>(env, [=]() {
-        return engine->destroy(obj);
-    });
-}
-
-extern "C" JNIEXPORT jboolean JNICALL
-Java_com_google_android_filament_Engine_nDestroySwapChain(JNIEnv *env, jclass,
-        jlong nativeEngine, jlong nativeObject) {
-    Engine* engine = (Engine*) nativeEngine;
-    SwapChain* obj = (SwapChain*) nativeObject;
     return wrapJni<jboolean>(env, [=]() {
         return engine->destroy(obj);
     });

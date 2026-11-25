@@ -237,12 +237,46 @@ private:
         return P2;
     }
 
+    /*
+     * Memory layout of Allocator's arena:
+     *
+     * The arena [mArea.begin(), p3) is partitioned into three fixed sub-ranges — one per size
+     * bucket (P0, P1, P2) — sized so each bucket can hold the same number of handles. Each
+     * sub-range is managed by a lazy high-water-mark PoolAllocator (mPool0, mPool1, mPool2) that
+     * only touches physical pages up to that bucket's own high-water mark (mCur):
+     *
+     *   p0 (mArea.begin())               p1                               p2                               p3
+     *   v                                v                                v                                v
+     *   +--------------+-----------------+--------------+-----------------+--------------+-----------------+
+     *   | Pool 0 (P0)  | untouched pages | Pool 1 (P1)  | untouched pages | Pool 2 (P2)  | untouched pages |
+     *   | [p0, mCur0)  | [mCur0, p1)     | [p1, mCur1)  | [mCur1, p2)     | [p2, mCur2)  | [mCur2, p3)     |
+     *   +--------------+-----------------+--------------+-----------------+--------------+-----------------+
+     *
+     * Per-slot layout and alignment (within each Pool<Pi>):
+     *
+     * PoolAllocator<Pi, MIN_ALIGNMENT, sizeof(Node)> aligns the first payload pointer in each pool
+     * with pointermath::align(begin, MIN_ALIGNMENT, sizeof(Node)) and advances mCur by
+     * STRIDE = (Pi + sizeof(Node) + MIN_ALIGNMENT - 1) & ~(MIN_ALIGNMENT - 1):
+     *
+     *         |<--------------------- STRIDE -------------------->|
+     *   ... --+----------------------+------------------+---------+------+ ...
+     *         |   payload (Pi bytes) |   alignment pad  |  Node   | next |
+     *         |   (or FreeList next) | (STRIDE - Pi - 1)| { age } | slot |
+     *   ... --+----------------------+------------------+---------+------+ ...
+     *   ^     ^                                         ^         ^
+     *   |     p (MIN_ALIGNMENT-aligned)                 |         next p (or mCur)
+     *   p[-1] = Node { age } for p                      next_p[-1] = Node { age } for next_p
+     *
+     * When a slot is bump-allocated from mCur for the first time, FreeList::pop() zeroes its
+     * 1-byte Node { age } prefix (p[-1].age = 0). Pages beyond each pool's mCur are never touched.
+     */
     class Allocator {
         friend class HandleAllocator;
         static constexpr size_t MIN_ALIGNMENT = alignof(std::max_align_t);
         struct Node { uint8_t age; };
         // Note: using the `extra` parameter of PoolAllocator<>, even with a 1-byte structure,
-        // generally increases all pool allocations by 8-bytes because of alignment restrictions.
+        // generally increases all pool allocations by MIN_ALIGNMENT bytes because of alignment
+        // restrictions.
         template<size_t SIZE>
         using Pool = utils::PoolAllocator<SIZE, MIN_ALIGNMENT, sizeof(Node)>;
         Pool<P0> mPool0;
@@ -306,6 +340,11 @@ private:
     // allocateHandleInPool()/deallocateHandleFromPool() with the right pool size.
     template<typename D>
     HandleBase::HandleId allocateHandle() {
+        // getAlignment() is alignof(std::max_align_t), which is 16 on some targets (e.g. x86-64,
+        // Android arm64) and 8 on others (e.g. armv7, Apple arm64, MSVC), so a 16-byte aligned
+        // type is only caught when building for the latter.
+        static_assert(alignof(D) <= Allocator::getAlignment(),
+                "handle pools don't support over-aligned types");
         constexpr size_t BUCKET_SIZE = getBucketSize<D>();
         return allocateHandleInPool<BUCKET_SIZE>();
     }

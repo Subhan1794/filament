@@ -30,6 +30,8 @@ import androidx.annotation.Nullable;
 import androidx.annotation.RestrictTo;
 import androidx.annotation.Size;
 
+import com.google.android.filament.proguard.UsedByNative;
+
 /**
  * A Renderer instance represents an operating system's window.
  *
@@ -740,6 +742,11 @@ public class Renderer {
      * beginFrame / endFrame block, but incurs less overhead. It can be used
      * as a poor man's compute API.</p>
      *
+     * <p>Unlike endFrame() and skipFrame(), renderStandaloneView() does not invoke Engine::gc().
+     * Applications that render exclusively with renderStandaloneView() (for example, in a loop)
+     * should call Engine::gc() periodically so destroyed entity IDs and dead components are
+     * reclaimed.</p>
+     *
      * <p>renderStandaloneView() must be called from the Engine's main thread
      * (or external synchronization must be provided). In particular, calls to
      * renderStandaloneView() on different Renderer instances <b>must</b> be synchronized.</p>
@@ -985,21 +992,36 @@ public class Renderer {
         /** value not yet available */
         public static final long PENDING = - 2;
 
+        @UsedByNative("Renderer.cpp")
         @IntRange(from = 0)
         public int frameId;
+        @UsedByNative("Renderer.cpp")
         public long gpuFrameDuration;
+        @UsedByNative("Renderer.cpp")
         public long denoisedGpuFrameDuration;
+        @UsedByNative("Renderer.cpp")
         public long beginFrame;
+        @UsedByNative("Renderer.cpp")
         public long endFrame;
+        @UsedByNative("Renderer.cpp")
         public long backendBeginFrame;
+        @UsedByNative("Renderer.cpp")
         public long backendEndFrame;
+        @UsedByNative("Renderer.cpp")
         public long gpuFrameComplete;
+        @UsedByNative("Renderer.cpp")
         public long vsync;
+        @UsedByNative("Renderer.cpp")
         public long displayPresent;
+        @UsedByNative("Renderer.cpp")
         public long presentDeadline;
+        @UsedByNative("Renderer.cpp")
         public long displayPresentInterval;
+        @UsedByNative("Renderer.cpp")
         public long compositionToPresentLatency;
+        @UsedByNative("Renderer.cpp")
         public long expectedPresentLatency;
+        @UsedByNative("Renderer.cpp")
         public long frameScheduleTime;
 
         public FrameInfo() {

@@ -26,6 +26,8 @@
 #include <filament/TransformManager.h>
 #include <filament/VertexBuffer.h>
 
+#include <utils/compiler.h>
+#include <utils/debug.h>
 #include <utils/Log.h>
 
 #include <math/mat4.h>
@@ -34,8 +36,13 @@
 #include <math/vec3.h>
 #include <math/vec4.h>
 
-#include <map>
+#include <cgltf.h>
+
+#include <algorithm>
+#include <cmath>
+#include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace filament;
@@ -45,12 +52,13 @@ using namespace utils;
 
 namespace filament::gltfio {
 
-using TimeValues = map<float, size_t>;
+using TimeValues = vector<float>;
 using SourceValues = vector<float>;
 using BoneVector = vector<mat4f>;
 
 struct Sampler {
     TimeValues times;
+    vector<size_t> indices;
     SourceValues values;
     enum { LINEAR, STEP, CUBIC } interpolation;
     size_t inputCount = 0;
@@ -88,47 +96,79 @@ struct AnimatorImpl {
     void updateBoneMatrices(FFilamentInstance* instance);
 };
 
+// Imports a sampler that has passed validateSampler(). On failure, dst.times is left empty, which
+// disables every channel that uses this sampler (see Animator::applyAnimation).
 static void createSampler(const cgltf_animation_sampler& src, Sampler& dst) {
-    // Copy the time values into a red-black tree.
+    // Unpack time values into a flat sorted vector. cgltf_accessor_unpack_floats honors the
+    // accessor stride and reads meshopt-decoded data when present.
     const cgltf_accessor* timelineAccessor = src.input;
-    const uint8_t* timelineBlob = nullptr;
-    const float* timelineFloats = nullptr;
-    if (timelineAccessor->buffer_view->has_meshopt_compression) {
-        timelineBlob = (const uint8_t*) timelineAccessor->buffer_view->data;
-        timelineFloats = (const float*) (timelineBlob + timelineAccessor->offset);
-    } else {
-        timelineBlob = (const uint8_t*) timelineAccessor->buffer_view->buffer->data;
-        timelineFloats = (const float*) (timelineBlob + timelineAccessor->offset +
-                timelineAccessor->buffer_view->offset);
-    }
-    for (size_t i = 0, len = timelineAccessor->count; i < len; ++i) {
-        dst.times[timelineFloats[i]] = i;
-    }   
-    dst.inputCount = timelineAccessor->count;
-    if (UTILS_UNLIKELY(dst.times.size() != dst.inputCount)) {
-        GLTFIO_WARN("Animation sampler has duplicate timestamps; animation disabled.");
+    dst.times.resize(timelineAccessor->count);
+    if (cgltf_accessor_unpack_floats(timelineAccessor, dst.times.data(), dst.times.size()) !=
+            dst.times.size()) {
+        GLTFIO_WARN("Unable to read animation timestamps; animation disabled.");
         dst.times.clear();
         return;
+    }
+    bool strictlyIncreasing = true;
+    for (size_t i = 0, len = dst.times.size(); i < len; ++i) {
+        if (UTILS_UNLIKELY(!std::isfinite(dst.times[i]))) {
+            GLTFIO_WARN("Animation sampler has non-finite timestamps; animation disabled.");
+            dst.times.clear();
+            return;
+        }
+        if (i > 0 && UTILS_UNLIKELY(dst.times[i] <= dst.times[i - 1])) {
+            strictlyIncreasing = false;
+        }
+    }
+    dst.inputCount = timelineAccessor->count;
+    if (UTILS_UNLIKELY(!strictlyIncreasing)) {
+        dst.indices.resize(dst.inputCount);
+        for (size_t i = 0; i < dst.inputCount; ++i) {
+            dst.indices[i] = i;
+        }
+        std::sort(dst.indices.begin(), dst.indices.end(), [&dst](size_t a, size_t b) {
+            return dst.times[a] < dst.times[b];
+        });
+        TimeValues sortedTimes(dst.inputCount);
+        for (size_t i = 0; i < dst.inputCount; ++i) {
+            sortedTimes[i] = dst.times[dst.indices[i]];
+            if (i > 0 && sortedTimes[i] == sortedTimes[i - 1]) {
+                GLTFIO_WARN("Animation sampler has duplicate timestamps; animation disabled.");
+                dst.times.clear();
+                dst.indices.clear();
+                return;
+            }
+        }
+        dst.times = std::move(sortedTimes);
     }
 
     // Convert source data to float.
     const cgltf_accessor* valuesAccessor = src.output;
+    cgltf_size componentCount;
     switch (valuesAccessor->type) {
         case cgltf_type_scalar:
-            dst.values.resize(valuesAccessor->count);
-            cgltf_accessor_unpack_floats(src.output, &dst.values[0], valuesAccessor->count);
+            componentCount = 1;
             break;
         case cgltf_type_vec3:
-            dst.values.resize(valuesAccessor->count * 3);
-            cgltf_accessor_unpack_floats(src.output, &dst.values[0], valuesAccessor->count * 3);
+            componentCount = 3;
             break;
         case cgltf_type_vec4:
-            dst.values.resize(valuesAccessor->count * 4);
-            cgltf_accessor_unpack_floats(src.output, &dst.values[0], valuesAccessor->count * 4);
+            componentCount = 4;
             break;
         default:
             GLTFIO_WARN("Unknown animation type.");
+            dst.times.clear();
+            dst.indices.clear();
             return;
+    }
+    dst.values.resize(valuesAccessor->count * componentCount);
+    if (cgltf_accessor_unpack_floats(valuesAccessor, dst.values.data(), dst.values.size()) !=
+            dst.values.size()) {
+        GLTFIO_WARN("Unable to read animation values; animation disabled.");
+        dst.times.clear();
+        dst.indices.clear();
+        dst.values.clear();
+        return;
     }
 
     switch (src.interpolation) {
@@ -167,17 +207,45 @@ static void setTransformType(const cgltf_animation_channel& src, Channel& dst) {
     }
 }
 
+// Returns the number of bytes that cgltf_buffer_view_data() can provide for the given bufferView,
+// or 0 if its data is unavailable. The Animator does not rely on cgltf_validate() having accepted
+// the asset, because buffers are not loaded and validated on every code path. For example, the
+// extended loader only loads buffers for assets that have primitives, and builds without a file
+// system allow external resources to be missing.
+static cgltf_size getReadableViewSize(const cgltf_buffer_view* view) {
+    if (view->data) {
+        // Only utility::decodeMeshoptCompression() sets bufferView data, and it allocates exactly
+        // count * stride bytes.
+        if (!view->has_meshopt_compression) {
+            return 0;
+        }
+        const cgltf_meshopt_compression& compression = view->meshopt_compression;
+        if (compression.stride == 0 ||
+                compression.count > std::numeric_limits<cgltf_size>::max() / compression.stride) {
+            return 0;
+        }
+        return std::min(view->size, compression.count * compression.stride);
+    }
+    const cgltf_buffer* buffer = view->buffer;
+    if (!buffer || !buffer->data || view->offset > buffer->size ||
+            view->size > buffer->size - view->offset) {
+        return 0;
+    }
+    return view->size;
+}
+
 static bool accessorFitsView(const cgltf_accessor* accessor) {
     const cgltf_buffer_view* view = accessor->buffer_view;
     if (!view || accessor->is_sparse || accessor->count == 0) {
         return false;
     }
+    const cgltf_size viewSize = getReadableViewSize(view);
     const cgltf_size elementSize = cgltf_calc_size(accessor->type, accessor->component_type);
     const cgltf_size stride = accessor->stride ? accessor->stride : elementSize;
-    if (elementSize == 0 || stride == 0 || accessor->offset > view->size) {
+    if (elementSize == 0 || stride == 0 || accessor->offset > viewSize) {
         return false;
     }
-    const cgltf_size available = view->size - accessor->offset;
+    const cgltf_size available = viewSize - accessor->offset;
     if (elementSize > available) {
         return false;
     }
@@ -250,7 +318,7 @@ static bool validateAnimation(const cgltf_animation& anim) {
 }
 
 Animator::Animator(FFilamentAsset const* asset, FFilamentInstance* instance) {
-    assert(asset->mResourcesLoaded && asset->mSourceAsset);
+    assert(asset->mResourcesValid && asset->mSourceAsset);
     mImpl = new AnimatorImpl();
     mImpl->asset = asset;
     mImpl->instance = instance;
@@ -286,7 +354,7 @@ Animator::Animator(FFilamentAsset const* asset, FFilamentInstance* instance) {
             Sampler& dstSampler = dstAnim.samplers[j];
             createSampler(srcSampler, dstSampler);
             if (dstSampler.times.size() > 1) {
-                float maxtime = (--dstSampler.times.end())->first;
+                float maxtime = dstSampler.times.back();
                 dstAnim.duration = std::max(dstAnim.duration, maxtime);
             }
         }
@@ -311,7 +379,11 @@ void Animator::applyCrossFade(size_t previousAnimIndex, float previousAnimTime, 
 void Animator::addInstance(FFilamentInstance* instance) {
     const cgltf_data* srcAsset = mImpl->asset->mSourceAsset->hierarchy;
     const cgltf_animation* srcAnims = srcAsset->animations;
-    for (cgltf_size i = 0, len = srcAsset->animations_count; i < len; ++i) {
+    // The animations vector is empty when the constructor rejected the source animations, so it is
+    // used as the loop bound rather than the glTF animation count.
+    assert_invariant(mImpl->animations.empty() ||
+            mImpl->animations.size() == srcAsset->animations_count);
+    for (size_t i = 0, len = mImpl->animations.size(); i < len; ++i) {
         const cgltf_animation& srcAnim = srcAnims[i];
         Animation& dstAnim = mImpl->animations[i];
         mImpl->addChannels(instance->mNodeMap, srcAnim, dstAnim);
@@ -341,7 +413,7 @@ void Animator::applyAnimation(size_t animationIndex, float time) const {
         const TimeValues& times = sampler->times;
 
         // Find the first keyframe after the given time, or the keyframe that matches it exactly.
-        TimeValues::const_iterator iter = times.lower_bound(time);
+        TimeValues::const_iterator iter = std::lower_bound(times.begin(), times.end(), time);
 
         // Compute the interpolant (between 0 and 1) and determine the keyframe pair.
         float t = 0.0f;
@@ -354,16 +426,20 @@ void Animator::applyAnimation(size_t animationIndex, float time) const {
             nextIndex = 0;
             prevIndex = 0;
         } else {
-            TimeValues::const_iterator prev = iter; --prev;
-            nextIndex = iter->second;
-            prevIndex = prev->second;
-            const float nextTime = iter->first;
-            const float prevTime = prev->first;
+            const size_t pos = static_cast<size_t>(iter - times.begin());
+            nextIndex = pos;
+            prevIndex = pos - 1;
+            const float nextTime = times[nextIndex];
+            const float prevTime = times[prevIndex];
             float deltaTime = nextTime - prevTime;
             assert(deltaTime >= 0);
             if (deltaTime > 0) {
                 t = (time - prevTime) / deltaTime;
             }
+        }
+        if (UTILS_UNLIKELY(!sampler->indices.empty())) {
+            nextIndex = sampler->indices[nextIndex];
+            prevIndex = sampler->indices[prevIndex];
         }
 
         if (sampler->interpolation == Sampler::STEP) {
@@ -401,10 +477,16 @@ void Animator::updateBoneMatrices() {
 }
 
 float Animator::getAnimationDuration(size_t animationIndex) const {
+    if (animationIndex >= mImpl->animations.size()) {
+        return 0.0f;
+    }
     return mImpl->animations[animationIndex].duration;
 }
 
 const char* Animator::getAnimationName(size_t animationIndex) const {
+    if (animationIndex >= mImpl->animations.size()) {
+        return "";
+    }
     return mImpl->animations[animationIndex].name.c_str();
 }
 
@@ -611,11 +693,14 @@ void AnimatorImpl::resetBoneMatrices(FFilamentInstance* instance) {
 }
 
 void AnimatorImpl::updateBoneMatrices(FFilamentInstance* instance) {
-    assert_invariant(instance->mSkins.size() == asset->mSkins.size());
     size_t skinIndex = 0;
     for (const auto& skin : instance->mSkins) {
+        if (UTILS_UNLIKELY(skinIndex >= asset->mSkins.size())) {
+            break;
+        }
         const auto& assetSkin = asset->mSkins[skinIndex++];
-        size_t njoints = skin.joints.size();
+        size_t const njoints = skin.joints.size();
+        size_t const safeJoints = std::min<size_t>(njoints, assetSkin.inverseBindMatrices.size());
         boneMatrices.resize(njoints);
         for (Entity entity : skin.targets) {
             auto renderable = renderableManager->getInstance(entity);
@@ -627,7 +712,7 @@ void AnimatorImpl::updateBoneMatrices(FFilamentInstance* instance) {
             if (xformable) {
                 inverseGlobalTransform = inverse(transformManager->getWorldTransformAccurate(xformable));
             }
-            for (size_t boneIndex = 0; boneIndex < njoints; ++boneIndex) {
+            for (size_t boneIndex = 0; boneIndex < safeJoints; ++boneIndex) {
                 const auto& joint = skin.joints[boneIndex];
                 const mat4f& inverseBindMatrix = assetSkin.inverseBindMatrices[boneIndex];
                 TransformManager::Instance jointInstance = transformManager->getInstance(joint);
@@ -635,6 +720,9 @@ void AnimatorImpl::updateBoneMatrices(FFilamentInstance* instance) {
                 boneMatrices[boneIndex] =
                         mat4f{ inverseGlobalTransform * globalJointTransform } *
                         inverseBindMatrix;
+            }
+            for (size_t boneIndex = safeJoints; boneIndex < njoints; ++boneIndex) {
+                boneMatrices[boneIndex] = mat4f{};
             }
             renderableManager->setBones(renderable, boneMatrices.data(), boneMatrices.size());
         }

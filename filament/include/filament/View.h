@@ -90,6 +90,7 @@ public:
     using SoftShadowOptions = filament::SoftShadowOptions;
     using ScreenSpaceReflectionsOptions = filament::ScreenSpaceReflectionsOptions;
     using GuardBandOptions = filament::GuardBandOptions;
+    using MotionVectorsOptions = filament::MotionVectorsOptions;
     using StereoscopicOptions = filament::StereoscopicOptions;
 
     /**
@@ -305,6 +306,28 @@ public:
     bool isShadowingEnabled() const noexcept;
 
     /**
+     * Enables or disables tighter shadow caster culling for directional shadow maps.
+     *
+     * <p>Disabled by default. This can improve performance by culling shadow casters more
+     * aggressively against the view frustum silhouette.</p>
+     *
+     * <p><b>Warning:</b> We discourage enabling this option when using advanced shadow filtering
+     * techniques such as Variance Shadow Maps (VSM), DPCF, PCSS, or shadow mipmapping. Because
+     * these filtering techniques sample across wide spatial regions or large blur kernels, shadow
+     * casters physically outside the unblurred view silhouette volume may contribute soft shadow
+     * penumbras inside the visible screen boundary. Culling them can introduce shadow
+     * boundary/edge clipping artifacts.</p>
+     *
+     * @param enabled true enables tighter shadow caster culling, false disables it.
+     */
+    void setTighterShadowCasterCullingEnabled(bool enabled) noexcept;
+
+    /**
+     * @return whether tighter shadow caster culling is enabled
+     */
+    bool isTighterShadowCasterCullingEnabled() const noexcept;
+
+    /**
      * Enables or disables screen space refraction. Enabled by default.
      *
      * @param enabled true enables screen space refraction, false disables it.
@@ -408,6 +431,25 @@ public:
      * @return guard band options
      */
     GuardBandOptions const& getGuardBandOptions() const noexcept;
+
+    /**
+     * Enables or disables the motion vectors pass. Disabled by default.
+     *
+     * Motion vectors are only generated when post-processing is enabled, stereo is disabled,
+     * the engine runs at feature level 1 or higher and the device supports RG16F render
+     * targets; otherwise this setting has no effect.
+     *
+     * @param options motion vectors options
+     * @see MotionVectorsOptions
+     */
+    void setMotionVectorsOptions(MotionVectorsOptions options) noexcept;
+
+    /**
+     * Returns the motion vectors options.
+     *
+     * @return motion vectors options
+     */
+    MotionVectorsOptions const& getMotionVectorsOptions() const noexcept;
 
     /**
      * Enables or disable multi-sample antialiasing (MSAA). Disabled by default.

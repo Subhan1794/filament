@@ -16,6 +16,7 @@
 
 #include "details/Engine.h"
 
+#include "Froxelizer.h"
 #include "MaterialParser.h"
 #include "RenderPrimitive.h"
 #include "TextureCache.h"
@@ -52,6 +53,7 @@
 
 #include <private/filament/DescriptorSets.h>
 #include <private/filament/EngineEnums.h>
+#include <private/filament/UibStructs.h>
 #include <private/filament/Variant.h>
 
 #include <filament/ColorGrading.h>
@@ -168,7 +170,7 @@ struct Engine::BuilderDetails {
     void* mSharedContext = nullptr;
     bool mPaused = false;
     std::unordered_map<CString, bool> mFeatureFlags;
-    ColorGrading::Builder mColorGradingBuilder;
+    std::optional<ColorGrading::Builder> mColorGradingBuilder;
 
     static Config validateConfig(Config config) noexcept;
 };
@@ -394,6 +396,9 @@ void FEngine::init() {
     LOG(INFO) << "Backend feature level: " << int(driverApi.getFeatureLevel());
     LOG(INFO) << "FEngine feature level: " << int(mActiveFeatureLevel);
 
+    // the object motion vectors pass renders into an RG16F color target
+    mIsRG16FColorRenderTargetSupported =
+            driverApi.isRenderTargetFormatSupported(TextureFormat::RG16F);
 
     mResourceAllocatorDisposer = std::make_shared<TextureCacheDisposer>(driverApi);
 
@@ -541,7 +546,13 @@ void FEngine::init() {
                     new UboManager(getDriverApi(), slotSize, mConfig.sharedUboInitialSizeInBytes);
         }
 
-        mDefaultColorGrading = downcast(mColorGradingBuilder.build(*this));
+        // A user-supplied ColorGrading::Builder may hold non-owning pointers (toneMapper,
+        // exportUser) whose lifetime only extends until Engine::Builder::build() returns, so build
+        // it synchronously here. Only the default builder path (!mColorGradingBuilder.has_value())
+        // is deferred to FEngine::getDefaultColorGrading().
+        if (mColorGradingBuilder.has_value()) {
+            mDefaultColorGrading = downcast(mColorGradingBuilder->build(*this));
+        }
 
         constexpr float3 dummyPositions[1] = {};
         constexpr short4 dummyTangents[1] = {};
@@ -566,12 +577,29 @@ void FEngine::init() {
         driverApi.update3DImage(mDummyZeroTextureArray, 0, 0, 0, 0, 1, 1, 1,
                 { zeroRGBA.data(), size(zeroRGBA), Texture::Format::RGBA, Texture::Type::UBYTE });
 
-        mDummyUniformBuffer = driverApi.createBufferObject(CONFIG_MINSPEC_UBO_SIZE,
+        size_t const dummyUboSize = std::max({
+                size_t(CONFIG_MINSPEC_UBO_SIZE),
+                sizeof(PerRenderableUib),
+                sizeof(PerRenderableBoneUib),
+                sizeof(PerRenderableMorphingUib),
+                sizeof(ShadowUib),
+                CONFIG_MAX_LIGHT_COUNT * sizeof(LightsUib),
+                Froxelizer::getFroxelBufferByteCount(driverApi),
+                Froxelizer::getFroxelRecordBufferByteCount(driverApi),
+        });
+        mDummyUniformBuffer = driverApi.createBufferObject(dummyUboSize,
                 BufferObjectBinding::UNIFORM, BufferUsage::STATIC);
+        if (UTILS_UNLIKELY(driverApi.isWorkaroundNeeded(Workaround::ADRENO_UNIFORM_ARRAY_CRASH))) {
+            auto* const initData = driverApi.allocatePod<PerRenderableBoneUib::BoneData>(1);
+            memset(initData, 0, sizeof(PerRenderableBoneUib::BoneData));
+            driverApi.updateBufferObject(mDummyUniformBuffer,
+                    { initData, sizeof(PerRenderableBoneUib::BoneData) }, 0);
+        }
 
         mLightManager.init(*this);
         mDFG.init(*this);
     }
+    mColorGradingBuilder.reset();
 
     mPostProcessManager.init();
 
@@ -827,10 +855,13 @@ void FEngine::gc() {
     mTransformManager.gc();
     mCameraManager.gc(*this);
     mRenderableManager.gc(getDriverApi());
+    mScenes.forEach([](FScene* scene) {
+        scene->gc();
+    });
 
-    // Because the managers just updated their watermarks to the current epoch,
-    // advanceEpoch() will see the highest possible safe threshold, allowing
-    // it to reclaim the maximum amount of global IDs this frame.
+    // Because the managers just drained their pending destructions and updated their watermarks
+    // to the latest harvested epoch, advanceEpoch() will see the highest possible safe threshold,
+    // allowing it to reclaim the maximum amount of global IDs this frame.
     mEntityManager.advanceEpoch();
 
     if (asyncJob) {
@@ -1012,6 +1043,15 @@ const FMaterial* FEngine::getSkyboxMaterial() noexcept {
         mSkyboxMaterial = FSkybox::createMaterial(*this);
     }
     return mSkyboxMaterial;
+}
+
+const FColorGrading* FEngine::getDefaultColorGrading() noexcept {
+    if (UTILS_UNLIKELY(mDefaultColorGrading == nullptr &&
+                getSupportedFeatureLevel() >= FeatureLevel::FEATURE_LEVEL_1)) {
+        assert_invariant(!mColorGradingBuilder.has_value());
+        mDefaultColorGrading = downcast(ColorGrading::Builder().build(*this));
+    }
+    return mDefaultColorGrading;
 }
 
 // -----------------------------------------------------------------------------------------------
@@ -1782,8 +1822,8 @@ FixedCapacityVector<Variant> FEngine::getMaterialCompileVariants(
         tribool const shadowReceiver,
         tribool const skinning) noexcept {
 
-    // the maximum possible is 6 variants (4 color + 2 depth)
-    auto variants = FixedCapacityVector<Variant>::with_capacity(6);
+    // the maximum possible is 8 variants (4 color + 2 depth + 2 motion vectors)
+    auto variants = FixedCapacityVector<Variant>::with_capacity(8);
 
     // apply() iteratively expands the `variants` vector by mutating existing elements
     // in-place if `value` is determinate, or by duplicating them if `value` is indeterminate.
@@ -1815,8 +1855,6 @@ FixedCapacityVector<Variant> FEngine::getMaterialCompileVariants(
     // isMaterialLit means shading != Shading::UNLIT || hasShadowMultiplier;
     const bool isMaterialLit = material->getDefinition().isVariantLit;
     Variant baseVariant{};
-    // TODO: Remove this after FOG is fully transferred to spec constant
-    baseVariant.setFog(false);
     baseVariant.setShadowSampler2D(isMaterialLit && view->hasShadowing() && (view->getShadowType() != ShadowType::PCF));
     baseVariant.setStereo(view->hasStereo());
 
@@ -1849,6 +1887,19 @@ FixedCapacityVector<Variant> FEngine::getMaterialCompileVariants(
         size_t const depthStart = variants.size();
         variants.push_back(depthVariant);
         apply(depthStart, skinning, &Variant::setSkinning);
+    }
+
+    // Use the options-derived state rather than isMotionVectorsActive(), which is only latched
+    // by prepare(): warm-up typically happens before the first frame. Only materials without a
+    // motion vectors program are skipped: they're always drawn depth-only in the motion vectors
+    // pass (see RenderPass). Translucent ones aren't, since their instances can write depth.
+    if (view->evaluateMotionVectorsActive(material->getEngine()) &&
+            material->hasMotionVectorsVariant()) {
+        Variant motionVectorsVariant{ Variant::DEPTH_VARIANT };
+        motionVectorsVariant.setMotionVectors(true);
+        size_t const motionVectorsStart = variants.size();
+        variants.push_back(motionVectorsVariant);
+        apply(motionVectorsStart, skinning, &Variant::setSkinning);
     }
 
     return variants;

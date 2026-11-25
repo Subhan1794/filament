@@ -43,6 +43,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <utility>
 
 namespace filament {
@@ -89,12 +90,15 @@ public:
 
     void terminate(backend::DriverApi& driverApi) noexcept;
 
-    // GPU buffer containing records. Valid after construction.
+    // Lazily allocates the GPU buffers for records and froxels if not already created.
+    void ensureBuffersCreated(backend::DriverApi& driverApi) noexcept;
+
+    // GPU buffer containing records. Lazily created via ensureBuffersCreated().
     backend::Handle<backend::HwBufferObject> getRecordBuffer() const noexcept {
         return mRecordsBuffer;
     }
 
-    // GPU buffer containing froxels. Valid after construction.
+    // GPU buffer containing froxels. Lazily created via ensureBuffersCreated().
     backend::Handle<backend::HwBufferObject> getFroxelBuffer() const noexcept {
         return mFroxelsBuffer;
     }
@@ -254,7 +258,7 @@ private:
             size_t froxelBufferEntryCount, Viewport const& viewport) noexcept;
 
     // internal state dependent on the viewport and needed for froxelizing
-    LinearAllocatorArena mArena;                        // ~256 KiB
+    std::optional<LinearAllocatorArena> mArena;         // ~256 KiB
 
     // 4096 froxels fits in a 16KiB buffer, the minimum guaranteed in GLES 3.x and Vulkan 1.1
     uint32_t mFroxelBufferEntryCount = 4096;

@@ -248,6 +248,8 @@ if (FILAMENT_SUPPORTS_VULKAN)
             src/vulkan/VulkanSemaphore.h
             src/vulkan/VulkanSemaphoreManager.cpp
             src/vulkan/VulkanSemaphoreManager.h
+            src/vulkan/VulkanSmallImagePool.cpp
+            src/vulkan/VulkanSmallImagePool.h
             src/vulkan/VulkanStagePool.cpp
             src/vulkan/VulkanStagePool.h
             src/vulkan/VulkanSwapChain.cpp
@@ -264,6 +266,7 @@ if (FILAMENT_SUPPORTS_VULKAN)
             src/vulkan/platform/VulkanPlatform.cpp
             src/vulkan/platform/VulkanPlatformSwapChainImpl.cpp
             src/vulkan/platform/VulkanPlatformSwapChainImpl.h
+            src/vulkan/utils/CommandBufferAgeCounter.h
             src/vulkan/utils/Conversion.cpp
             src/vulkan/utils/Conversion.h
             src/vulkan/utils/Definitions.h
@@ -495,13 +498,6 @@ if (MSVC)
 elseif(WASM)
     # Avoid strict-vtable-pointers here, it is broken in WebAssembly.
     set(OPTIMIZATION_FLAGS -fvisibility-inlines-hidden)
-elseif(FILAMENT_USING_GCC)
-    set(OPTIMIZATION_FLAGS
-        -ffast-math
-        -fno-finite-math-only
-        -ffp-contract=fast
-        -fvisibility-inlines-hidden
-    )
 else()
     set(OPTIMIZATION_FLAGS
         -ffast-math
@@ -510,7 +506,7 @@ else()
         # TODO: aggressive vectorization is currently broken on Android
         #        -fslp-vectorize-aggressive
         -fvisibility-inlines-hidden
-        -fstrict-vtable-pointers
+        $<$<CXX_COMPILER_ID:Clang,AppleClang>:-fstrict-vtable-pointers>
     )
 endif()
 
@@ -617,6 +613,7 @@ if (FILAMENT_BUILD_TESTING)
             test/test_Blit.cpp
             test/test_MissingRequiredAttributes.cpp
             test/test_ReadPixels.cpp
+            test/test_TimerQuery.cpp
             test/test_ReadTexture.cpp
             test/test_BufferUpdates.cpp
             test/test_AsyncCompletion.cpp
@@ -643,9 +640,11 @@ if (FILAMENT_BUILD_TESTING)
             test/test_ThreadPriorityOverride.cpp
             test/test_AsyncUploads.cpp
             test/test_Platform.cpp
+            test/test_VulkanPipelineCache.cpp
         )
         if (FILAMENT_SUPPORTS_VULKAN)
             list(APPEND BACKEND_TEST_SRC
+                    test/test_VulkanCommandBufferAgeCounter.cpp
                     test/test_VulkanSpirvUtils.cpp
             )
         endif()
@@ -654,11 +653,13 @@ if (FILAMENT_BUILD_TESTING)
                     test/test_WebGPUAsyncTaskCounter.cpp
                     test/test_WebGPUComposeSwizzle.cpp
                     test/test_WebGPUSpecializationConstantProcessor.cpp
+                    test/test_WebGPUTextureUsage.cpp
                     test/test_WebGPUVertexHelper.cpp)
         endif()
         if (APPLE)
             # Metal-specific tests
             list(APPEND BACKEND_TEST_SRC
+                test/test_MetalAsyncJobs.mm
                 test/test_MetalBlitter.mm
             )
         endif()
